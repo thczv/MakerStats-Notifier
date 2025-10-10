@@ -151,6 +151,10 @@ Periodic updates are sent according to the interval you set, for whatever period
 
 I like to set my 24-hour Summary to be delivered at the time (in my timezone) that corresponds to UTC+0, because that is the time when (as I understand it) a new day starts (for counting points) at MakerWorld. Given that the points I earn today will not be awarded until tomorrow (according to MakerWorld policy), this schedule is handy for giving me advance notice for the amount of points my models will receive tomorrow. 
 
+### Heartbeat
+
+I like feedback. So if the periodic refresh happens, and no changes to your models are detected, the extension sends a message anyway. It says "No new prints or downloads found."
+
 ### Prevent Background Throttling (Important!)
 
 Chrome aggressively throttles background tabs and inactive windows.
