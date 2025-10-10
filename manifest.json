@@ -1,0 +1,29 @@
+{
+  "manifest_version": 3,
+  "name": "MakerStats Notifier",
+  "version": "1.0",
+  "description": "Sends Telegram notifications about prints, downloads, and points earned on Makerworld.",
+  "permissions": [
+    "storage",
+    "scripting"
+  ],
+  "host_permissions": [
+    "https://makerworld.com/*",
+    "https://api.telegram.org/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": ["https://makerworld.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_end"
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": "icon.png"
+  },
+  "icons": {
+    "48": "icon.png",
+    "128": "icon.png"
+  }
+}
