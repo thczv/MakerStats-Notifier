@@ -145,7 +145,7 @@ The extension only tracks prints and downloads for models on MakerWorld. It does
 
 ### Time Creeping
 
-Periodic updates are sent according to a timer that you set, for whatever period you want. If you use 1 hour, the time when you receive the updates will creep a bit as the days go by. This is because it takes some time to load the page, scrape and store the data, send updates, etc (it is mostly extra time for loading the page completely). So if you start the extension at 1 pm, over time you will find the updates coming at 1:03 pm, or 1:07 pm. It will keep getting a bit later, because the extension just uses a timer and not a real clock. FYI. The exact time does not really matter, in most cases, so I am leaving it as is. 
+Periodic updates are sent according to the interval you set, for whatever period you want. For example, if you use a 1 hour interval, the actual time when you receive the updates will creep a bit as the days go by. This is because it takes some time to load the page, scrape and store the data, send updates, etc (it is mostly extra time for loading the page completely). So if you start the extension at 1 pm, over time you will find the updates coming at 1:03 pm, or 1:07 pm. It will keep getting a bit later, because the extension just uses a timer and not a real clock. FYI. The exact time does not really matter, in most cases, so I am leaving it as is. The 24-hour summary does rely upon the clock and should always update at about the time you set. 
 
 ### Points Prediction
 
