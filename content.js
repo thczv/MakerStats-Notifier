@@ -1,6 +1,4 @@
-
-
-const ITERATION = 'Iteration 20.4.1';
+const ITERATION = 'Iteration 20.5.1';
 console.log(`Initializing monitor — ${ITERATION}`);
 
 const autoScrollToFullBottom = ({ step = 600, delay = 250, settle = 800 } = {}) => new Promise(resolve => {
@@ -625,7 +623,49 @@ Total Reward Points: ${summary.rewardPointsTotal}
       await this.loadPreviousValues();
       await this.checkAndNotify();
       if (this.checkInterval) { clearInterval(this.checkInterval); this.checkInterval = null; }
-      this.checkInterval = setInterval(async () => { this.log('Scrolling before refresh...'); await autoScrollToFullBottom(); this.log('Refreshing page...'); window.location.reload(); }, intervalToUse);
+
+      const STORAGE_KEY = 'monitorNextScheduledTime';
+      let nextScheduled = Number(sessionStorage.getItem(STORAGE_KEY));
+
+      if (!nextScheduled) {
+        nextScheduled = Date.now() + intervalToUse;
+        this.log('Initializing schedule. First run at:', new Date(nextScheduled).toLocaleString());
+        sessionStorage.setItem(STORAGE_KEY, nextScheduled);
+      }
+
+      const scheduleNext = () => {
+        const now = Date.now();
+
+        if (now > nextScheduled) {
+          this.warn(`Missed scheduled time by ${Math.round((now - nextScheduled)/1000)}s. Running now.`);
+          while (nextScheduled < now) {
+            nextScheduled += intervalToUse;
+          }
+          sessionStorage.setItem(STORAGE_KEY, nextScheduled);
+        }
+
+        const delay = Math.max(0, nextScheduled - now);
+        this.log(`Next check scheduled for ${new Date(nextScheduled).toLocaleString()} (in ${Math.round(delay/1000)}s)`);
+
+        this.checkInterval = setTimeout(async () => {
+          try {
+            this.log('Scrolling before refresh...');
+            await autoScrollToFullBottom();
+            this.log('Refreshing page...');
+          } catch (err) {
+            this.error('Error during pre-refresh tasks:', err);
+          }
+
+          const newNextScheduled = nextScheduled + intervalToUse;
+          sessionStorage.setItem(STORAGE_KEY, newNextScheduled);
+
+          try { scheduleNext(); } catch (e) { this.error('Failed to schedule next run:', e); }
+          try { window.location.reload(); } catch (e) { this.error('Reload failed:', e); }
+        }, delay);
+      };
+
+      scheduleNext();
+
       if (config.dailyReport !== 'no') this.scheduleDailyNotification();
       this.log(`Monitor started, refresh every ${intervalToUse/60000} minutes (configured ${refreshInterval/60000} minutes)`);
     });

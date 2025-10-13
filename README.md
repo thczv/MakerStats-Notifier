@@ -143,10 +143,6 @@ When in Summary Mode, the extension counts and reports the number of models that
 
 The extension only tracks prints and downloads for models on MakerWorld. It does not track print profiles or the points received for "high quality" print profiles. Because of this, the number of points you actually receive will often be higher than the extension shows. 
 
-### Time Creeping
-
-Periodic updates are sent according to the interval you set, for whatever period you want. For example, if you use a 1 hour interval, the actual time when you receive the updates will creep a bit as the days go by. This is because it takes some time to load the page, scrape and store the data, send updates, etc (it is mostly extra time for loading the page completely). So if you start the extension at 1 pm, over time you will find the updates coming at 1:03 pm, or 1:07 pm. It will keep getting a bit later, because the extension just uses a timer and not a real clock. FYI. The exact time does not really matter, in most cases, so I am leaving it as is. The 24-hour summary does rely upon the clock and should always update at about the time you set. 
-
 ### Points Prediction
 
 I like to set my 24-hour Summary to be delivered at the time (in my timezone) that corresponds to UTC+0, because that is the time when (as I understand it) a new day starts (for counting points) at MakerWorld. Given that the points I earn today will not be awarded until tomorrow (according to MakerWorld policy), this schedule is handy for giving me advance notice for the amount of points my models will receive tomorrow. 
