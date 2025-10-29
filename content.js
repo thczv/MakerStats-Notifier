@@ -1,20 +1,35 @@
-const ITERATION = 'Iteration 20.5.1';
+const ITERATION = 'Iteration 20.6.9';
 console.log(`Initializing monitor — ${ITERATION}`);
 
-const autoScrollToFullBottom = ({ step = 600, delay = 250, settle = 800 } = {}) => new Promise(resolve => {
-  let timer;
+// Improved auto-scroller: requires the page height to remain stable for a
+// number of consecutive checks before resolving. This helps with slow or
+// incremental lazy-loading where elements append after short delays.
+const autoScrollToFullBottom = ({ step = 600, delay = 250, stableChecks = 4 } = {}) => new Promise(resolve => {
+  let timer = null;
+  let lastHeight = document.body.scrollHeight;
+  let stableCount = 0;
+
   const scrollAndCheck = () => {
-    window.scrollBy(0, step);
+    try { window.scrollBy(0, step); } catch (e) { /* ignore */ }
     const currentHeight = document.body.scrollHeight;
     const atBottom = (window.innerHeight + window.scrollY) >= (currentHeight - 2);
-    if (atBottom) {
+
+    if (currentHeight === lastHeight) {
+      stableCount += 1;
+    } else {
+      stableCount = 0;
+      lastHeight = currentHeight;
+    }
+
+    if (atBottom && stableCount >= stableChecks) {
       clearInterval(timer);
-      setTimeout(() => {
-        if (document.body.scrollHeight > currentHeight) timer = setInterval(scrollAndCheck, delay);
-        else resolve();
-      }, settle);
+      // allow micro-tasks to settle
+      setTimeout(resolve, 0);
     }
   };
+
+  // Run immediately to avoid waiting a full interval for first progress
+  scrollAndCheck();
   timer = setInterval(scrollAndCheck, delay);
 });
 
@@ -35,6 +50,9 @@ class ValueMonitor {
     this._dailyRunningRewardKey = 'dailyRunningRewardPoints';
     this._dailyRunningRewardDayKey = 'dailyRunningRewardDay';
     this._dailyLockTimeoutMs = 2 * 60 * 1000;
+  // processing lock to avoid race between periodic checks and daily summary
+  this._processingLockKey = 'processingLock';
+  this._processingLockTimeoutMs = 2 * 60 * 1000; // 2 minutes
     this._dailyMaxPreSendRetries = 5;
     this._dailyPreSendBaseBackoffMs = 300;
     this._dailyScheduleJitterMs = 30 * 1000;
@@ -211,6 +229,143 @@ class ValueMonitor {
     }));
   }
 
+  // processing lock helpers (shorter timeout) to avoid race between periodic checks and daily summary
+  async acquireProcessingLock(timeoutMs = this._processingLockTimeoutMs) {
+    const now = Date.now();
+    return new Promise(resolve => chrome.storage.local.get([this._processingLockKey], res => {
+      const lock = res?.[this._processingLockKey] || null;
+      if (!lock || (now - lock.ts) > timeoutMs) {
+        const newLock = { ts: now, owner: this._instanceId };
+        chrome.storage.local.set({ [this._processingLockKey]: newLock }, () => {
+          chrome.storage.local.get([this._processingLockKey], r2 => {
+            const confirmed = r2?.[this._processingLockKey]?.owner === this._instanceId;
+            this.log('acquireProcessingLock result', { confirmed, owner: r2?.[this._processingLockKey]?.owner, instance: this._instanceId });
+            resolve(confirmed);
+          });
+        });
+      } else { this.log('acquireProcessingLock failed, existing lock', lock); resolve(false); }
+    }));
+  }
+
+  async releaseProcessingLock() {
+    return new Promise(resolve => chrome.storage.local.get([this._processingLockKey], res => {
+      const lock = res?.[this._processingLockKey] || null;
+      if (lock && lock.owner === this._instanceId) {
+        chrome.storage.local.remove([this._processingLockKey], () => { this.log('releaseProcessingLock: released by', this._instanceId); resolve(true); });
+      } else resolve(false);
+    }));
+  }
+
+  // ---- BEGIN ADDITION: ReloadGuard helpers (insert into ValueMonitor class) ----
+
+  // Count models within 2 downloads (downloads + 2*prints) of the next reward
+  _countCloseToAward(models) {
+    if (!models) return 0;
+    let close = 0;
+    for (const m of Object.values(models)) {
+      const downloads = Number(m.downloads || 0);
+      const prints = Number(m.prints || 0);
+      const total = this.calculateDownloadsEquivalent(downloads, prints);
+      const next = this.nextRewardDownloads(total);
+      const remaining = Math.max(0, next - total);
+      if (remaining <= 2) close++;
+    }
+    return close;
+  }
+
+  /*
+    Detect incomplete load using 2-way check you specified.
+    prevModels: object (previous snapshot.models)
+    currModels: object (current snapshot.models)
+    awardedCount: number (models that actually received an award in this run)
+    Returns:
+   { suspect: bool, details: { prevTotal, currTotal, prevClose, currClose,
+   adjustedCurrClose, awardedCount, totalDrop, closeDrop } }
+  */
+  _detectIncompleteLoadChecks(prevModels = {}, currModels = {}, awardedCount = 0) {
+    const prevTotal = Object.keys(prevModels || {}).length;
+    const currTotal = Object.keys(currModels || {}).length;
+    const prevClose = this._countCloseToAward(prevModels || {});
+    const currClose = this._countCloseToAward(currModels || {});
+    const adjustedCurrClose = currClose + (Number(awardedCount) || 0);
+    const totalDrop = prevTotal - currTotal;
+    const closeDrop = prevClose - adjustedCurrClose;
+
+    const suspect = (totalDrop >= 4) && (closeDrop >= 2);
+  
+   return { suspect, details: { prevTotal, currTotal, prevClose,
+  currClose, adjustedCurrClose, awardedCount, totalDrop, closeDrop } };
+  }
+
+  // Soft re-scrape: scroll to bottom (auto-scroll repeated short steps) then re-run the DOM scrape method
+  async _rescrapeSoft({ step = 600, delay = 250, stableChecks = 3 } = {}) {
+    try {
+      // auto-scroll to bottom and wait for the DOM to settle
+      let lastHeight = document.body.scrollHeight;
+      let stable = 0;
+      while (true) {
+        window.scrollBy(0, step);
+        await new Promise(r => setTimeout(r, delay));
+        const h = document.body.scrollHeight;
+        const atBottom = (window.innerHeight + window.scrollY) >= (h - 2);
+        if (h === lastHeight) stable++; else { stable = 0; lastHeight = h; }
+        if (atBottom && stable >= stableChecks) break;
+      }
+      // small settle delay
+      await new Promise(r => setTimeout(r, 300));
+      // use your existing scrape function (e.g., getCurrentValues() or _scrapeData())
+      const newValues = this.getCurrentValues ? this.getCurrentValues() : (await this._scrapeData());
+      return newValues;
+    } catch (err) {
+      console.warn('[ReloadGuard] _rescrapeSoft failed', err);
+      return null;
+    }
+  }
+
+  // Per-day reload cap & cooldown
+  async _shouldReloadToday() {
+    const now = Date.now();
+    const today = new Date().toISOString().slice(0,10);
+    return new Promise(res => {
+      chrome.storage.local.get(['reloadCountDate','reloadCount','lastReloadAt'], r => {
+        const storedDate = r.reloadCountDate;
+        const reloadCount = r.reloadCount || 0;
+        const lastReloadAt = r.lastReloadAt || 0;
+        // reset if different day
+        if (storedDate !== today) {
+          chrome.storage.local.set({ reloadCountDate: today, reloadCount: 0 }, () => res(true));
+          return;
+        }
+        const cooldownMs = 60 * 1000; // 1 minute cooldown
+        const cap = 3; // 3 reloads per day
+        if (reloadCount >= cap) return res(false);
+        if ((now - lastReloadAt) < cooldownMs) return res(false);
+        return res(true);
+      });
+    });
+  }
+
+  async _incrementReloadCount() {
+    const today = new Date().toISOString().slice(0,10);
+    return new Promise(res => {
+      chrome.storage.local.get(['reloadCountDate','reloadCount'], r => {
+        const storedDate = r.reloadCountDate;
+        let reloadCount = r.reloadCount || 0;
+        if (storedDate !== today) {
+          reloadCount = 1;
+  
+         chrome.storage.local.set({ reloadCountDate: today, reloadCount,
+  lastReloadAt: Date.now() }, () => res({ reloadCount, today }));
+        } else {
+          reloadCount += 1;
+          chrome.storage.local.set({ reloadCount, lastReloadAt: Date.now() }, () => res({ reloadCount, today }));
+        }
+      });
+    });
+  }
+
+  // ---- END ADDITION ----
+
   // pre-send check to avoid duplicate daily sends
   async preSendCheckAndMaybeWait(startTime) {
     for (let attempt = 0; attempt < this._dailyMaxPreSendRetries; attempt++) {
@@ -288,13 +443,13 @@ class ValueMonitor {
     const rewardsEarned = []; let rewardPointsTotal = 0;
     for (const m of Object.values(modelChanges)) {
       const prevDownloadsTotal = this.calculateDownloadsEquivalent(m.previousDownloads, m.previousPrints);
-      const currDownloadsTotal = this.calculateDownloadsEquivalent(m.currentDownloads, m.currentPrints);
+      const currentDownloadsTotal = this.calculateDownloadsEquivalent(m.currentDownloads, m.currentPrints);
       let cursor = prevDownloadsTotal; const thresholdsHit = []; const maxThresholdsPerModel = 200; let thresholdsCount = 0;
-      while (cursor < currDownloadsTotal && thresholdsCount < maxThresholdsPerModel) {
+      while (cursor < currentDownloadsTotal && thresholdsCount < maxThresholdsPerModel) {
         const interval = this.getRewardInterval(cursor);
         const mod = cursor % interval;
         const nextThreshold = (cursor === 0 || mod === 0) ? cursor + interval : cursor + (interval - mod);
-        if (nextThreshold <= currDownloadsTotal) {
+        if (nextThreshold <= currentDownloadsTotal) {
           const rewardPoints = this.getRewardPointsForDownloads(nextThreshold);
           thresholdsHit.push({ threshold: nextThreshold, rewardPoints });
           rewardPointsTotal += rewardPoints;
@@ -314,6 +469,8 @@ class ValueMonitor {
   }
 
   // schedule daily report with locking/claiming
+  
+  // schedule daily report with locking/claiming (robust: persist planned time and detect missed after reload)
   scheduleDailyNotification() {
     if (this._dailyTimerId) { clearTimeout(this._dailyTimerId); this._dailyTimerId = null; }
     chrome.storage.sync.get(['dailyReport','dailyNotificationTime'], (config) => {
@@ -321,157 +478,326 @@ class ValueMonitor {
       if (dailyReport === 'no') { this.log('Daily report disabled'); return; }
       const dailyTime = config.dailyNotificationTime || '12:00';
       const [hour, minute] = dailyTime.split(':').map(Number);
-      const now = new Date(); const nextNotification = new Date(); nextNotification.setHours(hour, minute, 0, 0); if (nextNotification <= now) nextNotification.setDate(nextNotification.getDate()+1);
-      const jitter = Math.floor((Math.random()*2 -1) * this._dailyScheduleJitterMs);
-      const delay = Math.max(0, nextNotification - now + jitter);
-      this.log(`Daily report scheduled for: ${new Date(Date.now()+delay)}. Delay: ${delay}ms; jitterMs=${jitter}`);
+
+      // compute next notification at the configured hour/minute (local)
+      const now = new Date();
+      let nextNotification = new Date(now.getFullYear(), now.getMonth(), now.getDate(), hour, minute, 0, 0);
+      if (nextNotification.getTime() <= now.getTime()) nextNotification.setDate(nextNotification.getDate() + 1);
+
+      // small jitter to avoid exact collisions
+      const jitter = Math.floor((Math.random() * 2 - 1) * this._dailyScheduleJitterMs);
+      const delay = Math.max(0, nextNotification.getTime() - now.getTime() + jitter);
+
+      // persist the planned daily run so a reload can detect a missed run
+      try {
+        chrome.storage.local.set({ dailyPlannedAt: nextNotification.getTime() });
+      } catch (e) {
+        // ignore storage errors
+      }
+
+      this.log(`Daily report scheduled for: ${new Date(nextNotification.getTime()).toLocaleString()}. Delay: ${delay}ms; jitterMs=${jitter}`);
       this._dailyTimerId = setTimeout(async () => {
-        const startTime = Date.now(); this.log(`scheduleDailyNotification: firing attempt at ${new Date().toISOString()}`);
-        const claimantKey = this._lastSuccessfulKey; let clearPending=false, wrotePending=false, periodKey=null;
-        const gotLock = await this.acquireDailyLock();
-        if (!gotLock) { this.log('scheduleDailyNotification: could not acquire lock, another instance likely running. Aborting this attempt.'); this.scheduleDailyNotification(); return; }
-        try {
-          const latestAfterLock = await new Promise(res => chrome.storage.local.get([this._dailyStatsKey], r => res(r?.[this._dailyStatsKey] || null)));
-          if (latestAfterLock && latestAfterLock.timestamp >= startTime) { this.log('scheduleDailyNotification: dailyStats updated by another instance after lock; aborting this send.'); return; }
-          const nowMs = Date.now(); periodKey = await this.getCurrentPeriodKey();
-          const claimResult = await new Promise(res => {
-            chrome.storage.local.get([claimantKey], r => {
-              const existing = r?.[claimantKey] || null;
-              if (existing && existing.state === 'SENT' && existing.periodKey === periodKey) { res({ ok:false, reason:'already-sent', existing }); return; }
-              const PENDING_STALE_MS = 5 * 60 * 1000;
-              if (existing && existing.state === 'PENDING' && (nowMs - (existing.claimAt || 0)) < PENDING_STALE_MS && existing.periodKey === periodKey) { res({ ok:false, reason:'pending-claim', existing }); return; }
-              const claim = { state:'PENDING', owner:this._instanceId, claimAt: nowMs, periodKey };
-              chrome.storage.local.set({ [claimantKey]: claim }, () => { chrome.storage.local.get([claimantKey], v => { const confirmed = v?.[claimantKey]?.owner === this._instanceId && v[claimantKey].state === 'PENDING' && v[claimantKey].periodKey === periodKey; res({ ok:confirmed, claim }); }); });
-            });
-          });
-          if (!claimResult.ok) { this.log('scheduleDailyNotification: aborting send due to claim failure', claimResult.reason, claimResult.existing); return; }
-          wrotePending = true;
-          const okToSend = await this.preSendCheckAndMaybeWait(startTime);
-          if (!okToSend) { this.log('scheduleDailyNotification: preSendCheck indicates newer snapshot; aborting this send.'); clearPending = true; return; }
-          this.log(`Sending daily report: ${new Date()}`);
-          const summary = await this.getDailySummary();
-          if (summary) {
-            let rewardsSection = 'No rewards earned in the prior 24 hours';
-            if (summary.rewardsEarned?.length) rewardsSection = summary.rewardsEarned.map(r => `${r.name}: +${r.rewardPointsTotalForModel} points (thresholds: ${r.thresholds.join(', ')})`).join('\n');
-            const totalEquivalent = summary.dailyDownloads + (summary.dailyPrints * 2);
-            const topDownloadsList = summary.top5Downloads.length ? summary.top5Downloads.map((m,i)=>`${i+1}. ${m.name}: +${m.downloadsGained}`).join('\n') : 'No new downloads today';
-            const topPrintsList = summary.top5Prints.length ? summary.top5Prints.map((m,i)=>`${i+1}. ${m.name}: +${m.printsGained}`).join('\n') : 'No new prints today';
-            const message = `
-📊 24-Hour Summary (${summary.from} - ${summary.to}):
+        const startTime = Date.now();
+        this.log(`scheduleDailyNotification: firing attempt at ${new Date().toISOString()}`);
 
-Total Downloads: ${totalEquivalent} [total of downloads + 2x prints]
+        // When the daily runs, remove the persisted planned marker so other instances know it's handled
+        try { chrome.storage.local.remove('dailyPlannedAt'); } catch (e) {}
 
-🏆 Today's Most Downloaded:
-${topDownloadsList}
+        // Wait for any in-progress periodic processing to finish by checking the processing lock.
+        // Retry up to MAX_WAIT_ATTEMPTS with small randomized backoff.
+        const MAX_WAIT_ATTEMPTS = 10;
+        let processingBusy = false;
+        for (let i = 0; i < MAX_WAIT_ATTEMPTS; i++) {
+          const lock = await new Promise(res => chrome.storage.local.get([this._processingLockKey], r => res(r?.[this._processingLockKey] || null)));
+          if (!lock) { processingBusy = false; break; }
+          processingBusy = true;
+          const waitMs = 100 + Math.floor(Math.random() * 400);
+          this.log(`scheduleDailyNotification: waiting for processing lock to clear (attempt ${i + 1})`);
+          await new Promise(r => setTimeout(r, waitMs));
+        }
 
-🖨️ Today's Most Printed:
-${topPrintsList}
+        if (processingBusy) {
+          // ---- BEGIN REPLACEMENT: robust multi-retry loop for same-day summary ----
+          this.log('Daily summary collided with periodic check; entering retry loop.');
 
-🎁 Rewards earned in last 24 hours:
-${rewardsSection}
-Total Reward Points: ${summary.rewardPointsTotal}
-`.trim();
-            const sent = await this.sendTelegramMessage(message);
-            if (sent) {
-              const sentAt = Date.now();
-              const runningRewardPoints = await new Promise(res => chrome.storage.local.get([this._dailyRunningRewardKey], r => res(r?.[this._dailyRunningRewardKey] || 0)));
-              const finalRecord = { state:'SENT', owner:this._instanceId, sentAt, periodKey, snapshot:{ models: summary.top5Downloads.concat(summary.top5Prints).reduce((acc,m)=>{acc[m.id]=m;return acc;},{}), points: summary.points, timestamp: Date.now() }, rewardPointsTotal: runningRewardPoints };
-              await new Promise(resolve => chrome.storage.local.set({ [this._lastSuccessfulKey]: finalRecord }, () => { this.log('scheduleDailyNotification: wrote lastSuccessfulDailyReport SENT by', this._instanceId, 'sentAt=', new Date(sentAt).toISOString(), 'periodKey=', periodKey); resolve(); }));
-              try { chrome.storage.local.set({ [this._dailyRunningRewardKey]:0, [this._dailyRunningRewardDayKey]: periodKey }, () => { this.log('scheduleDailyNotification: reset running reward counter for period', { periodKey }); }); } catch (err) { this.error('Error resetting running reward counter for period', err); }
-            } else clearPending = true;
-          } else clearPending = true;
-        } finally {
-          try {
-            if (clearPending && claimantKey) {
-              chrome.storage.local.get([claimantKey], r => {
-                const existing = r?.[claimantKey] || null;
-                if (existing && existing.state === 'PENDING' && existing.owner === this._instanceId) chrome.storage.local.remove([claimantKey], () => { this.log('scheduleDailyNotification: cleared PENDING claim during cleanup'); });
-                else this.log('scheduleDailyNotification: skip clearing PENDING (not owner or not pending)', { existing });
-              });
+          const MAX_DAILY_RETRY_ATTEMPTS = 6;        // ~12 minutes total
+          const RETRY_INTERVAL_MS = 2 * 60 * 1000;   // 2 minutes between attempts
+          let attempt = 1;
+
+          const trySend = async () => {
+            this.log(`Daily summary retry attempt ${attempt}...`);
+
+            const lock = await new Promise(res =>
+              chrome.storage.local.get([this._processingLockKey],
+                r => res(r?.[this._processingLockKey] || null))
+            );
+
+            if (!lock) {
+              this.log('Processing lock cleared; sending daily summary now.');
+              try {
+                await this._compileAndSendDailySummary();
+              } catch (err) {
+                this.error('Retry daily summary error:', err);
+              } finally {
+                chrome.storage.local.remove(this._dailyLockKey);
+                this._dailyTimerId = null;
+                this.scheduleDailyNotification(); // schedule tomorrow
+              }
+              return;
             }
+
+            if (attempt < MAX_DAILY_RETRY_ATTEMPTS) {
+              attempt++;
+              setTimeout(trySend, RETRY_INTERVAL_MS);
+            } else {
+              this.warn('Daily summary still blocked after retries; skipping for today.');
+              chrome.storage.local.remove(this._dailyLockKey);
+              this._dailyTimerId = null;
+              this.scheduleDailyNotification(); // schedule tomorrow
+            }
+          };
+
+          setTimeout(trySend, RETRY_INTERVAL_MS);
+          return;
+          // ---- END REPLACEMENT ----
+        }
+
+        // Acquire an explicit daily lock to prevent concurrent daily runs across instances
+        const acquired = await new Promise(res => chrome.storage.local.get([this._dailyLockKey], r => {
+          const existing = r?.[this._dailyLockKey];
+          if (existing) return res(false);
+          chrome.storage.local.set({ [this._dailyLockKey]: Date.now() }, () => res(true));
+        }));
+
+        if (!acquired) {
+          this.log('scheduleDailyNotification: could not acquire daily lock; will retry in 60 seconds');
+          setTimeout(() => this.scheduleDailyNotification(), 60 * 1000);
+          return;
+        }
+
+        try {
+          // Also set a processing lock here so the periodic job yields to the daily summary.
+          await new Promise(res => chrome.storage.local.set({ [this._processingLockKey]: Date.now() }, res));
+          try {
+            await this._compileAndSendDailySummary();
           } finally {
-            await this.releaseDailyLock();
-            this.scheduleDailyNotification();
+            // release processing lock
+            chrome.storage.local.remove(this._processingLockKey);
           }
+        } catch (err) {
+          this.log('scheduleDailyNotification: error during daily summary', err);
+        } finally {
+          // release daily lock and schedule next day's run
+          chrome.storage.local.remove(this._dailyLockKey);
+          this._dailyTimerId = null;
+          // schedule next day's notification
+          this.scheduleDailyNotification();
         }
       }, delay);
     });
   }
 
+
   // main periodic check (per-model messages or summary)
   async checkAndNotify() {
-    if (this.isChecking) { this.log('Check already in progress, skipping...'); return; }
+    // Acquire a short-lived processing lock to prevent the daily summary from
+    // racing with periodic checks. If the lock cannot be acquired after a few
+    // attempts, skip this check to avoid overlapping work.
+    const MAX_LOCK_ATTEMPTS = 3;
+    let lockAcquired = false;
+    for (let attempt = 1; attempt <= MAX_LOCK_ATTEMPTS; attempt++) {
+      lockAcquired = await this.acquireProcessingLock();
+      if (lockAcquired) break;
+      const backoff = 100 + Math.floor(Math.random() * 200);
+      this.log(`checkAndNotify: processing lock busy, retrying in ${backoff}ms (attempt ${attempt})`);
+      await new Promise(r => setTimeout(r, backoff));
+    }
+    if (!lockAcquired) { this.log('Check skipped: processing lock could not be acquired.'); return; }
+    if (this.isChecking) { this.log('Check already in progress, skipping...'); await this.releaseProcessingLock(); return; }
     this.log(`checkAndNotify start — ${ITERATION}`); this.isChecking = true;
     try {
       this.log('Starting change check...');
       let anyNotification = false;
-      const currentValues = this.getCurrentValues();
+      let currentValues = this.getCurrentValues();
       if (!currentValues) { this.log('No current values found'); await this.savePreviousValues({}); return; }
       if (!this.previousValues) await this.loadPreviousValues();
       if (!this.previousValues) { this.log('First run or no previous values, saving initial values'); this.previousValues = currentValues; await this.savePreviousValues(currentValues); return; }
       if (this.previousValues && !this.previousValues.models) { this.previousValues.models = {}; await this.savePreviousValues(this.previousValues); }
       if (currentValues.points > (this.previousValues.points || 0)) this.log('Global account points increased, ignoring for per-model-only Telegram notifications.');
 
-      const modelsActivity = []; let modelUpdateCount = 0;
-      for (const [id, current] of Object.entries(currentValues.models)) {
-        const previous = this.previousValues.models[id];
-        if (!previous) continue;
-        const previousDownloadsRaw = Number(previous.downloads) || 0, previousPrints = Number(previous.prints) || 0, previousBoosts = Number(previous.boosts) || 0;
-        const previousDownloadsTotal = this.calculateDownloadsEquivalent(previousDownloadsRaw, previousPrints);
-        const currentDownloadsRaw = Number(current.downloads) || 0, currentPrints = Number(current.prints) || 0, currentBoosts = Number(current.boosts) || 0;
-        const currentDownloadsTotal = this.calculateDownloadsEquivalent(currentDownloadsRaw, currentPrints);
-        const downloadsDeltaRaw = currentDownloadsRaw - previousDownloadsRaw, printsDelta = currentPrints - previousPrints, boostsDelta = currentBoosts - previousBoosts;
-        const downloadsDeltaEquivalent = downloadsDeltaRaw + (printsDelta * 2);
-        const hasActivity = (downloadsDeltaRaw !== 0) || (printsDelta !== 0) || (boostsDelta > 0);
-        if (hasActivity) modelUpdateCount++;
-        const modelSummary = { id, name: current.name, imageUrl: current.imageUrl, downloadsDeltaRaw, printsDelta, boostsDelta, previousDownloadsTotal, currentDownloadsTotal, downloadsDeltaEquivalent, rewards: [] };
+      // This helper function computes the differences and rewards.
+      const _rebuildModelSummaries = (prev, curr) => {
+        const summaries = {};
+        for (const [id, current] of Object.entries(curr.models || {})) {
+          const previous = prev.models ? prev.models[id] : undefined;
+          if (!previous || !current) continue;
+          
+          const previousDownloadsRaw = Number(previous.downloads) || 0;
+          const previousPrints = Number(previous.prints) || 0;
+          const previousBoosts = Number(previous.boosts) || 0;
+          const previousDownloadsTotal = this.calculateDownloadsEquivalent(previousDownloadsRaw, previousPrints);
 
-        if (currentDownloadsTotal > previousDownloadsTotal) {
-          let cursor = previousDownloadsTotal, maxRewardsToReport = 50, rewardsFound = 0;
-          while (cursor < currentDownloadsTotal && rewardsFound < maxRewardsToReport) {
-            const interval = this.getRewardInterval(cursor), mod = cursor % interval;
-            const nextThreshold = (cursor === 0 || mod === 0) ? cursor + interval : cursor + (interval - mod);
-            this.log(`REWARD-LOOP ${current.name} cursor=${cursor} interval=${interval} nextThreshold=${nextThreshold} currDownloads=${currentDownloadsTotal}`);
-            if (nextThreshold <= currentDownloadsTotal) { const rewardPoints = this.getRewardPointsForDownloads(nextThreshold); modelSummary.rewards.push({ thresholdDownloads: nextThreshold, points: rewardPoints }); cursor = nextThreshold; rewardsFound++; } else break;
+          const currentDownloadsRaw = Number(current.downloads) || 0;
+          const currentPrints = Number(current.prints) || 0;
+          const currentBoosts = Number(current.boosts) || 0;
+
+          let currentDownloadsTotal = 0;
+          try {
+            currentDownloadsTotal = this.calculateDownloadsEquivalent(currentDownloadsRaw, currentPrints);
+          } catch (err) {
+            this.warn('_rebuildModelSummaries: failed to compute currentDownloadsTotal for', id, err);
+            currentDownloadsTotal = currentDownloadsRaw + currentPrints * 2; // safe fallback
           }
-          if (rewardsFound >= maxRewardsToReport) this.log(`Many rewards earned for ${current.name}. Listed first ${maxRewardsToReport} in summary.`);
-        }
 
-        const boostOnly = (boostsDelta > 0) && (downloadsDeltaRaw === 0 && printsDelta === 0 && modelSummary.rewards.length === 0);
+          const downloadsDeltaRaw = currentDownloadsRaw - previousDownloadsRaw;
+          const printsDelta = currentPrints - previousPrints;
+          const boostsDelta = currentBoosts - previousBoosts;
+          const downloadsDeltaEquivalent = downloadsDeltaRaw + (printsDelta * 2);
+          
+          const hasActivity = (downloadsDeltaRaw !== 0) || (printsDelta !== 0) || (boostsDelta > 0);
+          
+          const modelSummary = {
+            id,
+            name: current.name,
+            imageUrl: current.imageUrl,
+            downloadsDeltaRaw,
+            printsDelta,
+            boostsDelta,
+            previousDownloadsTotal,
+            currentDownloadsTotal,
+            downloadsDeltaEquivalent,
+            rewards: []
+          };
+
+          if (currentDownloadsTotal > previousDownloadsTotal) {
+            let cursor = previousDownloadsTotal, maxRewardsToReport = 50, rewardsFound = 0;
+            while (cursor < currentDownloadsTotal && rewardsFound < maxRewardsToReport) {
+              const interval = this.getRewardInterval(cursor), mod = cursor % interval;
+              const nextThreshold = (cursor === 0 || mod === 0) ? cursor + interval : cursor + (interval - mod);
+              if (nextThreshold <= currentDownloadsTotal) {
+                const rewardPoints = this.getRewardPointsForDownloads(nextThreshold);
+                modelSummary.rewards.push({ thresholdDownloads: nextThreshold, points: rewardPoints });
+                cursor = nextThreshold;
+                rewardsFound++;
+              } else {
+                break;
+              }
+            }
+          }
+          if (hasActivity || modelSummary.rewards.length > 0) {
+            summaries[id] = modelSummary;
+          }
+        }
+        return summaries;
+      };
+
+      let modelSummaries = _rebuildModelSummaries(this.previousValues, currentValues);
+
+      // ---- BEGIN INSERT: call reload-guard check before sending ----
+
+      // Ensure we have a previous snapshot (use the persisted previousValues you already store)
+      const prevModelsSnapshot = this.previousValues?.models || {};
+
+      const awardedModelsThisRun = Object.values(modelSummaries || {}).filter(ms => (ms.rewards && ms.rewards.length > 0)).length;
+
+      // run detection
+      const detection = this._detectIncompleteLoadChecks(prevModelsSnapshot, currentValues.models || {}, awardedModelsThisRun);
+      this.log('ReloadGuard initial detection:', detection);
+
+      let warningPrefix = '';
+      let diagnosticText = '';
+
+      if (detection.suspect) {
+        // 1) Try soft re-scrape
+        const soft = await this._rescrapeSoft();
+        if (soft) {
+          const newDetection = this._detectIncompleteLoadChecks(prevModelsSnapshot, soft.models || {}, awardedModelsThisRun);
+          this.log('ReloadGuard after soft re-scrape:', newDetection);
+          if (!newDetection.suspect) {
+            // use the rescrape values for send
+            currentValues = soft;
+            // recompute modelSummaries vs previousValues
+            modelSummaries = _rebuildModelSummaries(this.previousValues, currentValues);
+            this.log('ReloadGuard: soft re-scrape successful. Using new data.');
+          } else {
+            // still suspect after soft rescrape
+            const canReload = await this._shouldReloadToday();
+            if (canReload) {
+              await this._incrementReloadCount();
+              this.log('ReloadGuard: reloading page to recover full data...');
+              window.location.reload();
+              // IMPORTANT: abort this cycle so we don't send a potentially bad update
+              return;
+            } else {
+              // cannot reload (cap/cooldown) — send with warning and diagnostics
+              warningPrefix = '⚠️ Data may be inaccurate due to incomplete page loading.\n\n';
+              const d = detection.details;
+              diagnosticText = `Diagnostics: prevTotal=${d.prevTotal}, currTotal=${d.currTotal}, totalDrop=${d.totalDrop}; prevClose=${d.prevClose}, currClose=${d.currClose}, adjustedCurrClose=${d.adjustedCurrClose}, closeDrop=${d.closeDrop}; awardedThisRun=${d.awardedCount}\n\n`;
+            }
+          }
+        } else {
+          // rescrape failed; same process: reload if allowed, else warn
+          const canReload = await this._shouldReloadToday();
+          if (canReload) {
+            await this._incrementReloadCount();
+            window.location.reload();
+            return;
+          } else {
+            warningPrefix = '⚠️ Data may be inaccurate due to incomplete page loading.\n\n';
+            const d = detection.details;
+            diagnosticText = `Diagnostics: prevTotal=${d.prevTotal}, currTotal=${d.currTotal}, totalDrop=${d.totalDrop}; prevClose=${d.prevClose}, currClose=${d.currClose}, adjustedCurrClose=${d.adjustedCurrClose}, closeDrop=${d.closeDrop}; awardedThisRun=${d.awardedCount}\n\n`;
+          }
+        }
+      }
+      
+      // ---- END INSERT ----
+
+
+      const modelsActivity = [];
+      const modelUpdateCount = Object.keys(modelSummaries).length;
+
+      for (const [id, modelSummary] of Object.entries(modelSummaries)) {
+        const current = currentValues.models[id];
+        const { boostsDelta, downloadsDeltaRaw, printsDelta, rewards } = modelSummary;
+        
+        const boostOnly = (boostsDelta > 0) && (downloadsDeltaRaw === 0 && printsDelta === 0 && rewards.length === 0);
         if (!this.notifySummaryMode) {
           if (boostOnly) {
             const lines = [];
-            lines.push(`⚡ Boost Update for: ${current.name}`, '', `⚡ Boosts: +${boostsDelta} (now ${currentBoosts})`);
-            const message = lines.join('\n');
-            this.log('MESSAGE-BRANCH', { iteration: ITERATION, name: current.name, branch: 'boost-only', downloadsDeltaEquivalent, boostsDelta, rewardsFound: modelSummary.rewards.length });
+            lines.push(`⚡ Boost Update for: ${current.name}`, '', `⚡ Boosts: +${boostsDelta} (now ${current.boosts})`);
+            let message = lines.join('\n');
+            message = warningPrefix + diagnosticText + message; // Prepend warning if any
+            warningPrefix = ''; diagnosticText = ''; // Clear after first use
+            this.log('MESSAGE-BRANCH', { iteration: ITERATION, name: current.name, branch: 'boost-only', boostsDelta, rewardsFound: rewards.length });
             this.log(`Sending boost-only message for ${current.name}`);
             const sent = await this.sendTelegramMessageWithPhoto(message, modelSummary.imageUrl);
             anyNotification = true; continue;
           }
 
-          const hasActivity2 = (downloadsDeltaRaw !== 0) || (printsDelta !== 0) || (modelSummary.rewards.length > 0) || (boostsDelta > 0);
+          const hasActivity2 = (downloadsDeltaRaw !== 0) || (printsDelta !== 0) || (rewards.length > 0) || (boostsDelta > 0);
           if (hasActivity2) {
-            this.log('MESSAGE-BRANCH', { iteration: ITERATION, name: current.name, branch: 'milestone', downloadsDeltaEquivalent, boostsDelta, rewardsFound: modelSummary.rewards.length });
-            const lines = []; const equivalentTotal = currentDownloadsTotal;
-            lines.push(`📦 Update for: ${current.name}`, '', `${downloadsDeltaEquivalent > 0 ? '+' : ''}${downloadsDeltaEquivalent} Downloads (total ${equivalentTotal})`, '');
-            if (modelSummary.rewards.length > 0) { modelSummary.rewards.forEach(r => lines.push(`🎁 Reward Earned! +${r.points} points at ${r.thresholdDownloads} downloads`)); lines.push(''); }
+            this.log('MESSAGE-BRANCH', { iteration: ITERATION, name: current.name, branch: 'milestone', downloadsDeltaEquivalent: modelSummary.downloadsDeltaEquivalent, boostsDelta, rewardsFound: rewards.length });
+            const lines = []; const equivalentTotal = modelSummary.currentDownloadsTotal;
+            lines.push(`📦 Update for: ${current.name}`, '', `${modelSummary.downloadsDeltaEquivalent > 0 ? '+' : ''}${modelSummary.downloadsDeltaEquivalent} Downloads (total ${equivalentTotal})`, '');
+            if (rewards.length > 0) { rewards.forEach(r => lines.push(`🎁 Reward Earned! +${r.points} points at ${r.thresholdDownloads} downloads`)); lines.push(''); }
             const nextThresholdAfterCurrent = this.nextRewardDownloads(equivalentTotal);
             const downloadsUntilNext = Math.max(0, nextThresholdAfterCurrent - equivalentTotal);
             lines.push(`🎯 Next Reward: ${downloadsUntilNext} more downloads (${nextThresholdAfterCurrent} total)`, '', `🔁 Reward Interval: every ${this.getRewardInterval(equivalentTotal)} downloads`);
-            if (boostsDelta > 0) lines.push('', `⚡ Boosts: +${boostsDelta} (now ${currentBoosts})`);
+            if (boostsDelta > 0) lines.push('', `⚡ Boosts: +${boostsDelta} (now ${current.boosts})`);
             let warning = '';
             if (Math.abs(downloadsDeltaRaw) > this._suspiciousDeltaLimit || Math.abs(printsDelta) > this._suspiciousDeltaLimit) {
               warning = "\n\n⚠️ The number of downloads or prints during this period is very high. This could be because your model is very popular (good job!). Or it could be an error. You may want to shorten the refresh interval.";
             }
-            const message = lines.join('\n') + warning;
+            let message = lines.join('\n') + warning;
+            message = warningPrefix + diagnosticText + message; // Prepend warning if any
+            warningPrefix = ''; diagnosticText = ''; // Clear after first use
             this.log(`Sending milestone message for ${current.name}`);
             const sent = await this.sendTelegramMessageWithPhoto(message, modelSummary.imageUrl);
-            if (sent && modelSummary.rewards.length > 0) { const pts = modelSummary.rewards.reduce((s,r)=>s+r.points,0); await this._accumulateDailyRewardPoints(pts); }
+            if (sent && rewards.length > 0) { const pts = rewards.reduce((s,r)=>s+r.points,0); await this._accumulateDailyRewardPoints(pts); }
             anyNotification = true;
           }
         } else {
-          const hasActivity3 = (downloadsDeltaRaw !== 0) || (printsDelta !== 0) || (modelSummary.rewards.length > 0) || (boostsDelta > 0);
-          if (hasActivity3) modelsActivity.push({ id, name: current.name, downloadsDeltaEquivalent, currentDownloadsTotal: currentDownloadsTotal, rewardPointsForThisModel: modelSummary.rewards.reduce((s,r)=>s+r.points,0), boostsDelta });
+          modelsActivity.push({ id, name: current.name, downloadsDeltaEquivalent: modelSummary.downloadsDeltaEquivalent, currentDownloadsTotal: modelSummary.currentDownloadsTotal, rewardPointsForThisModel: rewards.reduce((s,r)=>s+r.points,0), boostsDelta });
         }
       }
 
@@ -484,7 +810,7 @@ Total Reward Points: ${summary.rewardPointsTotal}
       if (useSummaryMode) {
         if (forceSummaryMode) await this.sendTelegramMessage("Switching to summary mode due to the high number of updates this period. This ensures Telegram limits are not reached.");
         if (modelsActivity.length === 0) {
-          await this.sendTelegramMessage("No new prints or downloads found."); anyNotification = true;
+          await this.sendTelegramMessage(warningPrefix + diagnosticText + "No new prints or downloads found."); anyNotification = true;
           const prevString = JSON.stringify(this.previousValues||{}), currString = JSON.stringify(currentValues||{});
           if (prevString !== currString) { this.previousValues = currentValues; await this.savePreviousValues(currentValues); }
           this.isChecking = false; return;
@@ -548,7 +874,7 @@ Total Reward Points: ${summary.rewardPointsTotal}
 		  `Models close to 🎁: ${closeToGiftCount}`
 		];
 
-        const message = headerLines.join('\n') + '\n' + spacedModels + '\n' + footerLines.join('\n');
+        const message = warningPrefix + diagnosticText + headerLines.join('\n') + '\n' + spacedModels + '\n' + footerLines.join('\n');
         this.log('Aggregated summary message length:', message.length);
         const sent = await this.sendTelegramMessage(message); if (sent) anyNotification = true;
       } else {
@@ -557,9 +883,9 @@ Total Reward Points: ${summary.rewardPointsTotal}
 
       const prevString = JSON.stringify(this.previousValues || {}), currString = JSON.stringify(currentValues || {});
       if (prevString !== currString) { this.previousValues = currentValues; await this.savePreviousValues(currentValues); } else this.log('No changes detected, skipping savePreviousValues to reduce storage writes.');
-      if (!anyNotification && !useSummaryMode) { const heartbeatMsg = 'No new prints or downloads found.'; this.log(heartbeatMsg); await this.sendTelegramMessage(heartbeatMsg); }
+      if (!anyNotification && !useSummaryMode) { const heartbeatMsg = 'No new prints or downloads found.'; this.log(heartbeatMsg); await this.sendTelegramMessage(warningPrefix + diagnosticText + heartbeatMsg); }
     } catch (err) { this.error('Error during check:', err); }
-    finally { this.isChecking = false; }
+    finally { this.isChecking = false; try { await this.releaseProcessingLock(); } catch (e) { this.warn('Failed to release processing lock', e); } }
   }
 
   // accumulate running points with lock and retries
@@ -625,12 +951,14 @@ Total Reward Points: ${summary.rewardPointsTotal}
       if (this.checkInterval) { clearInterval(this.checkInterval); this.checkInterval = null; }
 
       const STORAGE_KEY = 'monitorNextScheduledTime';
-      let nextScheduled = Number(sessionStorage.getItem(STORAGE_KEY));
+      // Use chrome.storage.local for persistence across browser restarts
+      const stored = await new Promise(res => chrome.storage.local.get([STORAGE_KEY], r => res(r)));
+      let nextScheduled = stored ? stored[STORAGE_KEY] : null;
 
-      if (!nextScheduled) {
+      if (!nextScheduled || nextScheduled < Date.now()) {
         nextScheduled = Date.now() + intervalToUse;
         this.log('Initializing schedule. First run at:', new Date(nextScheduled).toLocaleString());
-        sessionStorage.setItem(STORAGE_KEY, nextScheduled);
+        chrome.storage.local.set({ [STORAGE_KEY]: nextScheduled });
       }
 
       const scheduleNext = () => {
@@ -641,7 +969,7 @@ Total Reward Points: ${summary.rewardPointsTotal}
           while (nextScheduled < now) {
             nextScheduled += intervalToUse;
           }
-          sessionStorage.setItem(STORAGE_KEY, nextScheduled);
+          chrome.storage.local.set({ [STORAGE_KEY]: nextScheduled });
         }
 
         const delay = Math.max(0, nextScheduled - now);
@@ -657,10 +985,12 @@ Total Reward Points: ${summary.rewardPointsTotal}
           }
 
           const newNextScheduled = nextScheduled + intervalToUse;
-          sessionStorage.setItem(STORAGE_KEY, newNextScheduled);
-
-          try { scheduleNext(); } catch (e) { this.error('Failed to schedule next run:', e); }
+          chrome.storage.local.set({ [STORAGE_KEY]: newNextScheduled }, () => {
+             // We don't schedule the next one here anymore. The page reload will restart the script.
+          });
+          
           try { window.location.reload(); } catch (e) { this.error('Reload failed:', e); }
+
         }, delay);
       };
 
@@ -680,10 +1010,30 @@ Total Reward Points: ${summary.rewardPointsTotal}
 
   async restart() {
     this.log('Restarting monitor on request...');
-    this.stop();
-    await autoScrollToFullBottom();
-    await this.checkAndNotify();
-    this.start();
+    try {
+        // Clear in-memory timers (main and daily) — note main timer is stored in checkInterval
+        if (this.checkInterval) { clearTimeout(this.checkInterval); this.checkInterval = null; }
+        if (this._timerId) { clearTimeout(this._timerId); this._timerId = null; }
+        if (this._dailyTimerId) { clearTimeout(this._dailyTimerId); this._dailyTimerId = null; }
+    } catch (e) {
+        console.warn('Restart cleanup error:', e);
+    }
+
+    // Reset any stored timestamps so we don't reuse the old next-run baseline
+    this._lastCheck = null;
+    this._lastSummaryTs = null;
+
+    console.log('Monitor fully reset — starting new cycle from now.');
+    try {
+      // Remove persisted next-run so start() will compute a fresh schedule from now
+      const STORAGE_KEY = 'monitorNextScheduledTime';
+      chrome.storage.local.remove([STORAGE_KEY], () => {
+        // Use start() (the class's actual bootstrap) to re-initialize
+        this.start().catch(err => this.error('restart: start() failed', err));
+      });
+    } catch (err) {
+      this.error('restart: failed to clear persisted schedule or start', err);
+    }
   }
 
   // interim summary (manual request)
@@ -747,6 +1097,64 @@ ${rewardsEarned.length > 0 ? rewardsEarned.map(r => `${r.name}: +${r.rewardPoint
     if (!sent) { this.error('Interim summary: failed to send via Telegram'); throw new Error('Telegram send failed'); }
     this.log('Interim summary: sent successfully');
     return true;
+  }
+
+  // ---------------------------------------------------------------------------
+  // NEW: Restore _compileAndSendDailySummary for 24-hour daily report
+  // ---------------------------------------------------------------------------
+  async _compileAndSendDailySummary() {
+    try {
+      this.log('_compileAndSendDailySummary: starting daily report');
+      const summary = await this.getDailySummary();
+      if (!summary) {
+        this.warn('_compileAndSendDailySummary: getDailySummary() returned null');
+        return;
+      }
+
+      // Build message
+      const lines = [];
+      lines.push(`📅 Daily Summary (${summary.from} → ${summary.to})`, '');
+
+      lines.push(`Total Downloads Today: ${summary.dailyDownloads}`);
+      lines.push(`Total Prints Today: ${summary.dailyPrints}`);
+      
+      // Show both current total and daily delta for full context
+      const netChange =
+        summary.pointsGained > 0 ? `+${summary.pointsGained}` :
+        summary.pointsGained < 0 ? `${summary.pointsGained}` : '±0';
+      lines.push(`Account Points: ${summary.points}  (net change ${netChange})`);
+      lines.push('');
+
+      if (summary.top5Downloads?.length) {
+        lines.push('🏆 Top 5 Downloads:');
+        summary.top5Downloads.forEach((m, i) => {
+          lines.push(`${i + 1}. ${m.name} (+${m.downloadsGained})`);
+        });
+        lines.push('');
+      }
+
+      if (summary.top5Prints?.length) {
+        lines.push('🖨️ Top 5 Prints:');
+        summary.top5Prints.forEach((m, i) => {
+          lines.push(`${i + 1}. ${m.name} (+${m.printsGained})`);
+        });
+        lines.push('');
+      }
+
+      if (summary.rewardsEarned?.length) {
+        const totalRewards = summary.rewardPointsTotal || 0;
+        lines.push(`🎁 Rewards Earned Today: +${totalRewards} pts`);
+      } else {
+        lines.push('🎁 No new rewards earned today');
+      }
+
+      const message = lines.join('\n');
+      this.log('_compileAndSendDailySummary: message length =', message.length);
+      await this.sendTelegramMessage(message);
+      this.log('_compileAndSendDailySummary: daily summary sent successfully');
+    } catch (err) {
+      this.error('_compileAndSendDailySummary error:', err);
+    }
   }
 }
 

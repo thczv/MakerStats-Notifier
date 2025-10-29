@@ -163,4 +163,50 @@ document.addEventListener('DOMContentLoaded', function () {
             });
         });
     });
-});
+    // Get the new button element and add its listener
+    const restartTimerButton = document.getElementById('restartTimerButton');
+    restartTimerButton.addEventListener('click', function () {
+        showStatus('Restarting timer...');
+
+        // Broadcast REFRESH_INTERVAL_UPDATED to every MakerWorld tab
+        chrome.tabs.query({ url: '*://makerworld.com/*' }, function (tabs) {
+            if (!tabs || !tabs.length) {
+                showStatus('No MakerWorld tabs found — open a MakerWorld page first.');
+                return;
+            }
+
+            let successes = 0;
+            for (const tab of tabs) {
+                chrome.tabs.sendMessage(
+                    tab.id,
+                    { type: 'REFRESH_INTERVAL_UPDATED' },
+                    (resp) => {
+                        if (chrome.runtime.lastError) {
+                            console.warn(
+                                `Restart message failed for tab ${tab.id}:`,
+                                chrome.runtime.lastError.message
+                            );
+                            return;
+                        }
+                        successes++;
+                        console.log(
+                            `Timer restart message delivered to tab ${tab.id}`
+                        );
+                    }
+                );
+            }
+
+            showStatus(
+                `Restart command sent to ${tabs.length} tab${
+                    tabs.length > 1 ? 's' : ''
+                }.`
+            );
+        });
+
+        // Also send a runtime-wide broadcast in case a background listener exists
+        chrome.runtime.sendMessage({ type: 'REFRESH_INTERVAL_UPDATED' }, () => {
+            /* ignore response */
+        });
+    }); // ← closes restartTimerButton click handler
+
+}); // ← closes the outer DOMContentLoaded wrapper
