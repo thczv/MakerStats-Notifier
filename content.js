@@ -1,4 +1,4 @@
-const ITERATION = 'Iteration 20.6.9';
+const ITERATION = 'Iteration 20.6.19';
 console.log(`Initializing monitor — ${ITERATION}`);
 
 // Improved auto-scroller: requires the page height to remain stable for a
@@ -47,15 +47,19 @@ class ValueMonitor {
     this._dailyLockKey = 'dailyLock';
     this._dailyStatsKey = 'dailyStats';
     this._lastSuccessfulKey = 'lastSuccessfulDailyReport';
-    this._dailyRunningRewardKey = 'dailyRunningRewardPoints';
-    this._dailyRunningRewardDayKey = 'dailyRunningRewardDay';
     this._dailyLockTimeoutMs = 2 * 60 * 1000;
+    // new keys/guards
+    this._dailyPlannedKey = this._dailyPlannedKey;
+    this._lastDailySentKey = 'lastDailySentAt';
+    this._dailyLockBaseKey = 'dailyLock';
+    this._dailyLockHoldMs = 3 * 60 * 1000; // hold daily lock for 3 minutes
+
   // processing lock to avoid race between periodic checks and daily summary
   this._processingLockKey = 'processingLock';
   this._processingLockTimeoutMs = 2 * 60 * 1000; // 2 minutes
     this._dailyMaxPreSendRetries = 5;
     this._dailyPreSendBaseBackoffMs = 300;
-    this._dailyScheduleJitterMs = 30 * 1000;
+    this._dailyScheduleJitterMs = 10 * 1000; // reduced jitter ±10s
     this._defaultFallbackHours = 48;
     this.notifySummaryMode = false;
     this._telegramMaxMessageChars = 4000;
@@ -188,18 +192,30 @@ class ValueMonitor {
   nextRewardDownloads(totalDownloads){ const interval = this.getRewardInterval(totalDownloads); const mod = totalDownloads % interval; return (totalDownloads === 0 || mod === 0) ? totalDownloads + interval : totalDownloads + (interval - mod); }
   getRewardPointsForDownloads(thresholdDownloads){ if (thresholdDownloads <= 50) return 15; if (thresholdDownloads <= 500) return 12; if (thresholdDownloads <= 1000) return 20; return 30; }
   calculateDownloadsEquivalent(downloads, prints){ return Number(downloads||0) + (Number(prints||0) * 2); }
+    getRewardCategory(downloads, prints) {
+    const total = this.calculateDownloadsEquivalent(downloads, prints);
+    if (total <= 49) return 1;
+    if (total <= 499) return 2;
+    if (total <= 999) return 3;
+    return 4;
+  }
+
 
   // storage lock helpers
   async acquireDailyLock(timeoutMs = this._dailyLockTimeoutMs) {
+    // Use a per-day lock key to avoid cross-day collisions
+    const today = new Date().toISOString().slice(0,10);
+    const lockKey = `${this._dailyLockBaseKey}_${today}`;
+
     const now = Date.now();
-    return new Promise(resolve => chrome.storage.local.get([this._dailyLockKey], res => {
+    return new Promise(resolve => chrome.storage.local.get([lockKey], res => {
       const lock = res?.[this._dailyLockKey] || null;
       if (!lock || (now - lock.ts) > timeoutMs) {
         if (lock && (now - lock.ts) > timeoutMs) {
-          chrome.storage.local.remove([this._dailyLockKey], () => {
+          chrome.storage.local.remove([lockKey], () => {
             const newLock = { ts: now, owner: this._instanceId };
-            chrome.storage.local.set({ [this._dailyLockKey]: newLock }, () => {
-              chrome.storage.local.get([this._dailyLockKey], r2 => {
+            chrome.storage.local.set({ [lockKey]: newLock }, () => {
+              chrome.storage.local.get([lockKey], r2 => {
                 const confirmed = r2?.[this._dailyLockKey]?.owner === this._instanceId;
                 this.log('acquireDailyLock (force unlock) result', { confirmed, owner: r2?.[this._dailyLockKey]?.owner, instance: this._instanceId });
                 resolve(confirmed);
@@ -208,8 +224,8 @@ class ValueMonitor {
           });
         } else {
           const newLock = { ts: now, owner: this._instanceId };
-          chrome.storage.local.set({ [this._dailyLockKey]: newLock }, () => {
-            chrome.storage.local.get([this._dailyLockKey], r2 => {
+          chrome.storage.local.set({ [lockKey]: newLock }, () => {
+            chrome.storage.local.get([lockKey], r2 => {
               const confirmed = r2?.[this._dailyLockKey]?.owner === this._instanceId;
               this.log('acquireDailyLock result', { confirmed, owner: r2?.[this._dailyLockKey]?.owner, instance: this._instanceId });
               resolve(confirmed);
@@ -221,10 +237,10 @@ class ValueMonitor {
   }
 
   async releaseDailyLock() {
-    return new Promise(resolve => chrome.storage.local.get([this._dailyLockKey], res => {
+    return new Promise(resolve => chrome.storage.local.get([lockKey], res => {
       const lock = res?.[this._dailyLockKey] || null;
       if (lock && lock.owner === this._instanceId) {
-        chrome.storage.local.remove([this._dailyLockKey], () => { this.log('releaseDailyLock: released by', this._instanceId); resolve(true); });
+        chrome.storage.local.remove([lockKey], () => { this.log('releaseDailyLock: released by', this._instanceId); resolve(true); });
       } else resolve(false);
     }));
   }
@@ -377,70 +393,57 @@ class ValueMonitor {
     return true;
   }
 
-  // robust daily summary computation and storage
-  async getDailySummary() {
+  // side-effect-free computation of rewards since baseline
+  async computeRewardsSinceBaseline() {
+    await autoScrollToFullBottom();
     const currentValues = this.getCurrentValues();
-    if (!currentValues) { this.error('Unable to get current values'); return null; }
-    this.log('getDailySummary START — now:', new Date().toISOString());
-    this.log('getDailySummary: currentValues.models count =', Object.keys(currentValues.models || {}).length, 'timestamp=', new Date(currentValues.timestamp).toISOString());
-
-    const [previousDayRaw, maxStaleMs] = await Promise.all([
-      new Promise(res => chrome.storage.local.get([this._dailyStatsKey], r => res(r?.[this._dailyStatsKey] || null))),
-      new Promise(res => chrome.storage.sync.get(['dailyFallbackMaxAgeMs'], cfg => {
-        const cfgVal = cfg?.dailyFallbackMaxAgeMs; res(Number.isFinite(cfgVal) ? cfgVal : (this._defaultFallbackHours*60*60*1000));
-      }))
-    ]);
-
-    let raw = previousDayRaw;
-    if (!raw) {
-      for (let i=0;i<3 && !raw;i++){ this.log('getDailySummary: dailyStats missing — retrying read (attempt)', i+1); await new Promise(r=>setTimeout(r,1000)); raw = await new Promise(res => chrome.storage.local.get([this._dailyStatsKey], r2 => res(r2?.[this._dailyStatsKey] || null))); }
+    if (!currentValues) {
+      this.error('Unable to get current values for compute');
+      return { rewardPointsTotal: 0, dailyDownloads: 0, dailyPrints: 0, dailyBoosts: 0, points: 0, pointsGained: 0, modelChanges: {}, rewardsEarned: [] /* add other fields as needed */ };
     }
-    if (raw) this.log('getDailySummary: read dailyStats from storage:', { ts: new Date(raw.timestamp).toISOString(), ageMs: Date.now()-raw.timestamp, modelsCount: Object.keys(raw.models || {}).length, points: raw.points, owner: raw.owner || null, periodKey: raw.periodKey || null });
-    else this.log('getDailySummary: no dailyStats found in storage after retries.');
 
-    const ONE_DAY_MS = 24*60*60*1000;
+    const previousDayRaw = await new Promise(res => chrome.storage.local.get([this._dailyStatsKey], r => res(r?.[this._dailyStatsKey] || null)));
+    const maxStaleMs = await new Promise(res => chrome.storage.sync.get(['dailyFallbackMaxAgeMs'], cfg => {
+      const cfgVal = cfg?.dailyFallbackMaxAgeMs; res(Number.isFinite(cfgVal) ? cfgVal : (this._defaultFallbackHours * 60 * 60 * 1000));
+    }));
+
     let previousDay = null;
-    if (raw) {
-      const ageMs = Date.now() - raw.timestamp;
-      if (ageMs <= ONE_DAY_MS) previousDay = raw, this.log('getDailySummary: using fresh snapshot', new Date(raw.timestamp).toISOString());
-      else if (ageMs <= maxStaleMs) previousDay = raw, this.warn('getDailySummary: using STALE snapshot as fallback', new Date(raw.timestamp).toISOString(), `ageMs=${ageMs}`);
-      else this.log('getDailySummary: snapshot too old, treating as missing', new Date(raw.timestamp).toISOString(), `ageMs=${ageMs}`);
+    if (previousDayRaw) {
+      const ageMs = Date.now() - previousDayRaw.timestamp;
+      if (ageMs <= 24 * 60 * 60 * 1000) previousDay = previousDayRaw;
+      else if (ageMs <= maxStaleMs) previousDay = previousDayRaw, this.warn('Using stale baseline for compute');
+      else this.log('Baseline too old, treating as missing');
     }
 
     if (!previousDay) {
-      this.log('getDailySummary: No previous day data available or snapshot unusable. Writing current snapshot and returning empty summary.');
-      const periodKey = await this.getCurrentPeriodKey();
-      chrome.storage.local.set({ [this._dailyStatsKey]: { models: currentValues.models, points: currentValues.points, timestamp: Date.now(), owner: this._instanceId, periodKey } }, () => {
-        this.log('getDailySummary: stored dailyStats ts=', new Date().toISOString(), 'modelsCount=', Object.keys(currentValues.models || {}).length, 'owner=', this._instanceId, 'periodKey=', periodKey);
-      });
-      chrome.storage.local.set({ [this._dailyRunningRewardKey]: 0, [this._dailyRunningRewardDayKey]: periodKey, [this._lastSuccessfulKey]: { state:'SENT', owner:this._instanceId, sentAt:Date.now(), periodKey, snapshot:{ models: currentValues.models, points: currentValues.points, timestamp: Date.now() }, rewardPointsTotal:0 } });
-      return { dailyDownloads:0, dailyPrints:0, points: currentValues.points, pointsGained:0, top5Downloads:[], top5Prints:[], rewardsEarned:[], rewardPointsTotal:0, from:new Date().toLocaleString('en-US', { month: '2-digit', day: '2-digit', year: 'numeric', hour: 'numeric', minute: '2-digit' }), to:new Date().toLocaleString('en-US', { month: '2-digit', day: '2-digit', year: 'numeric', hour: 'numeric', minute: '2-digit' }) };
+      // No baseline: return empty (don't update storage here)
+      return { dailyDownloads: 0, dailyPrints: 0, dailyBoosts: 0, points: currentValues.points, pointsGained: 0, modelChanges: {}, rewardsEarned: [], rewardPointsTotal: 0 };
     }
 
-    // compare
+    // Compute modelChanges, rewards
     const modelChanges = {};
-    this.log('getDailySummary: comparing models; previousDay.models count', Object.keys(previousDay.models || {}).length);
     for (const [id, current] of Object.entries(currentValues.models)) {
       let previous = previousDay?.models?.[id] || null;
       if (!previous && current.permalink) previous = Object.values(previousDay.models || {}).find(m => m?.permalink === current.permalink) || null;
-      if (!previous && current.name) { const norm = current.name.trim().toLowerCase(); previous = Object.values(previousDay.models || {}).find(m => m?.name?.trim().toLowerCase() === norm) || null; if (previous) this.log('getDailySummary: matched previous by name', { id, name: current.name }); }
-      if (!previous) { this.log('New model found:', current.name, 'id=', id, 'permalink=', current.permalink); continue; }
+      if (!previous && current.name) { const norm = current.name.trim().toLowerCase(); previous = Object.values(previousDay.models || {}).find(m => m?.name?.trim().toLowerCase() === norm) || null; }
+      if (!previous) continue;
 
       const prevDownloads = Number(previous.downloads || 0), prevPrints = Number(previous.prints || 0), currDownloads = Number(current.downloads || 0), currPrints = Number(current.prints || 0);
-      let downloadsGained = currDownloads - prevDownloads, printsGained = currPrints - prevPrints;
-      if (downloadsGained <= 0 && printsGained <= 0) continue;
-      if (downloadsGained > this._suspiciousDeltaLimit || printsGained > this._suspiciousDeltaLimit) { this.warn('Suspiciously large delta detected, skipping reward calculation for', { id, name: current.name, downloadsGained, printsGained, prevTs: previous.timestamp || null }); continue; }
+      const prevBoosts = Number(previous.boosts || 0), currBoosts = Number(current.boosts || 0);
+      let downloadsGained = currDownloads - prevDownloads, printsGained = currPrints - prevPrints, boostsGained = currBoosts - prevBoosts;
 
-      modelChanges[id] = { id, name: current.name, downloadsGained, printsGained, previousDownloads: prevDownloads, previousPrints: prevPrints, currentDownloads: currDownloads, currentPrints: currPrints, permalink: current.permalink || previous?.permalink || null };
+      if (downloadsGained <= 0 && printsGained <= 0 && boostsGained <= 0) continue;
+      if (downloadsGained > this._suspiciousDeltaLimit || printsGained > this._suspiciousDeltaLimit) continue;
+
+      modelChanges[id] = { id, name: current.name, downloadsGained, printsGained, boostsGained, previousDownloads: prevDownloads, previousPrints: prevPrints, currentDownloads: currDownloads, currentPrints: currPrints, permalink: current.permalink || previous?.permalink || null };
     }
 
-    const dailyDownloads = Object.values(modelChanges).reduce((s,m)=>s+m.downloadsGained,0);
-    const dailyPrints = Object.values(modelChanges).reduce((s,m)=>s+m.printsGained,0);
-    const top5Downloads = Object.values(modelChanges).filter(m=>m.downloadsGained>0).sort((a,b)=>b.downloadsGained-a.downloadsGained).slice(0,5);
-    const top5Prints = Object.values(modelChanges).filter(m=>m.printsGained>0).sort((a,b)=>b.printsGained-a.printsGained).slice(0,5);
+    const dailyDownloads = Object.values(modelChanges).reduce((s, m) => s + m.downloadsGained, 0);
+    const dailyPrints = Object.values(modelChanges).reduce((s, m) => s + m.printsGained, 0);
+    const dailyBoosts = Object.values(modelChanges).reduce((s, m) => s + (m.boostsGained || 0), 0);
 
-    // compute rewards
-    const rewardsEarned = []; let rewardPointsTotal = 0;
+    const rewardsEarned = [];
+    let rewardPointsTotal = 0;
     for (const m of Object.values(modelChanges)) {
       const prevDownloadsTotal = this.calculateDownloadsEquivalent(m.previousDownloads, m.previousPrints);
       const currentDownloadsTotal = this.calculateDownloadsEquivalent(m.currentDownloads, m.currentPrints);
@@ -456,23 +459,38 @@ class ValueMonitor {
           cursor = nextThreshold; thresholdsCount++;
         } else break;
       }
-      if (thresholdsHit.length) rewardsEarned.push({ id:m.id, name:m.name, thresholds:thresholdsHit.map(t=>t.threshold), rewardPointsTotalForModel:thresholdsHit.reduce((s,t)=>s+t.rewardPoints,0) });
+      if (thresholdsHit.length) rewardsEarned.push({ id: m.id, name: m.name, thresholds: thresholdsHit.map(t => t.threshold), rewardPointsTotalForModel: thresholdsHit.reduce((s, t) => s + t.rewardPoints, 0) });
     }
 
+    return { dailyDownloads, dailyPrints, dailyBoosts, points: currentValues.points, pointsGained: currentValues.points - previousDay.points, rewardsEarned, rewardPointsTotal, modelChanges, from: new Date(previousDay.timestamp).toLocaleString('en-US', { month: '2-digit', day: '2-digit', year: 'numeric', hour: 'numeric', minute: '2-digit' }), to: new Date().toLocaleString('en-US', { month: '2-digit', day: '2-digit', year: 'numeric', hour: 'numeric', minute: '2-digit' }) };
+  }
+
+  // robust daily summary computation and storage
+  async getDailySummary() {
+    await autoScrollToFullBottom();
+    const summary = await this.computeRewardsSinceBaseline();
+    const currentValues = this.getCurrentValues();
     const periodKey = await this.getCurrentPeriodKey();
     chrome.storage.local.set({ [this._dailyStatsKey]: { models: currentValues.models, points: currentValues.points, timestamp: Date.now(), owner: this._instanceId, periodKey } }, () => {
       this.log('getDailySummary: updated dailyStats ts=', new Date().toISOString(), 'modelsCount=', Object.keys(currentValues.models || {}).length, 'owner=', this._instanceId, 'periodKey', periodKey);
     });
-    chrome.storage.local.set({ [this._dailyRunningRewardKey]: 0, [this._dailyRunningRewardDayKey]: periodKey, [this._lastSuccessfulKey]: { state:'SENT', owner:this._instanceId, sentAt:Date.now(), periodKey, snapshot:{ models: currentValues.models, points: currentValues.points, timestamp: Date.now() }, rewardPointsTotal:0 } });
-
-    return { dailyDownloads, dailyPrints, points: currentValues.points, pointsGained: currentValues.points - previousDay.points, top5Downloads, top5Prints, rewardsEarned, rewardPointsTotal, from: new Date(previousDay.timestamp).toLocaleString('en-US', { month: '2-digit', day: '2-digit', year: 'numeric', hour: 'numeric', minute: '2-digit' }), to: new Date().toLocaleString('en-US', { month: '2-digit', day: '2-digit', year: 'numeric', hour: 'numeric', minute: '2-digit' }) };
+    return summary;
   }
 
-  // schedule daily report with locking/claiming
-  
   // schedule daily report with locking/claiming (robust: persist planned time and detect missed after reload)
-  scheduleDailyNotification() {
+  async scheduleDailyNotification() {
     if (this._dailyTimerId) { clearTimeout(this._dailyTimerId); this._dailyTimerId = null; }
+    // Guard: if a planned daily run is already persisted for a future time, skip scheduling a duplicate
+    try {
+      const planned = await new Promise(res => chrome.storage.local.get([this._dailyPlannedKey], r => res(r?.[this._dailyPlannedKey] || null)));
+      if (planned && planned > Date.now()) {
+        this.log('scheduleDailyNotification: a planned daily run already exists for a future time; skipping duplicate schedule.', new Date(planned).toLocaleString());
+        return;
+      }
+    } catch (e) {
+      // ignore storage read errors and continue scheduling
+    }
+
     chrome.storage.sync.get(['dailyReport','dailyNotificationTime'], (config) => {
       const dailyReport = config.dailyReport || 'yes';
       if (dailyReport === 'no') { this.log('Daily report disabled'); return; }
@@ -490,7 +508,7 @@ class ValueMonitor {
 
       // persist the planned daily run so a reload can detect a missed run
       try {
-        chrome.storage.local.set({ dailyPlannedAt: nextNotification.getTime() });
+        chrome.storage.local.set({ [this._dailyPlannedKey]: nextNotification.getTime() });
       } catch (e) {
         // ignore storage errors
       }
@@ -500,8 +518,23 @@ class ValueMonitor {
         const startTime = Date.now();
         this.log(`scheduleDailyNotification: firing attempt at ${new Date().toISOString()}`);
 
+        // Deduplication: if a daily send recently occurred, skip this run
+        try {
+          const lastSent = await new Promise(res => chrome.storage.local.get([this._lastDailySentKey], r => res(r?.[this._lastDailySentKey] || null)));
+          const MIN_MS_BETWEEN_DAILIES = 5 * 60 * 1000; // 5 minutes
+          if (lastSent && (Date.now() - lastSent) < MIN_MS_BETWEEN_DAILIES) {
+            this.log('scheduleDailyNotification: skipping because a daily summary was sent recently', new Date(lastSent).toISOString());
+            // clear persisted planned marker and schedule tomorrow
+            try { chrome.storage.local.remove(this._dailyPlannedKey); } catch(e){}
+            this._dailyTimerId = null;
+            this.scheduleDailyNotification();
+            return;
+          }
+        } catch(e) { /* ignore storage errors */ }
+
+
         // When the daily runs, remove the persisted planned marker so other instances know it's handled
-        try { chrome.storage.local.remove('dailyPlannedAt'); } catch (e) {}
+        try { chrome.storage.local.remove([this._dailyPlannedKey]); } catch (e) {}
 
         // Wait for any in-progress periodic processing to finish by checking the processing lock.
         // Retry up to MAX_WAIT_ATTEMPTS with small randomized backoff.
@@ -536,10 +569,13 @@ class ValueMonitor {
               this.log('Processing lock cleared; sending daily summary now.');
               try {
                 await this._compileAndSendDailySummary();
+                // mark last sent timestamp
+                try { chrome.storage.local.set({ [this._lastDailySentKey]: Date.now() }); } catch(e){}
               } catch (err) {
                 this.error('Retry daily summary error:', err);
               } finally {
-                chrome.storage.local.remove(this._dailyLockKey);
+                // release per-day daily lock if present for today
+                try { const today = new Date().toISOString().slice(0,10); const lockKey = `${this._dailyLockBaseKey}_${today}`; chrome.storage.local.remove([lockKey]); } catch(e){}
                 this._dailyTimerId = null;
                 this.scheduleDailyNotification(); // schedule tomorrow
               }
@@ -793,7 +829,6 @@ class ValueMonitor {
             warningPrefix = ''; diagnosticText = ''; // Clear after first use
             this.log(`Sending milestone message for ${current.name}`);
             const sent = await this.sendTelegramMessageWithPhoto(message, modelSummary.imageUrl);
-            if (sent && rewards.length > 0) { const pts = rewards.reduce((s,r)=>s+r.points,0); await this._accumulateDailyRewardPoints(pts); }
             anyNotification = true;
           }
         } else {
@@ -818,27 +853,10 @@ class ValueMonitor {
 
         const totalEquivalent = modelsActivity.reduce((s,m)=>s + (m.downloadsDeltaEquivalent||0),0);
         const rewardPointsThisRun = modelsActivity.reduce((s,m)=>s + (m.rewardPointsForThisModel||0),0);
-        await this._accumulateDailyRewardPoints(rewardPointsThisRun);
 
-        const persisted = await new Promise(res => chrome.storage.local.get([this._dailyRunningRewardKey, this._dailyRunningRewardDayKey, this._dailyStatsKey, this._lastSuccessfulKey], r => res(r)));
-        let running = Number.isFinite(persisted?.[this._dailyRunningRewardKey]) ? persisted[this._dailyRunningRewardKey] : 0;
-        const runningDay = persisted?.[this._dailyRunningRewardDayKey] || null;
-        const lastDaily = persisted?.[this._lastSuccessfulKey] || null;
-        const lastDailyPoints = Number.isFinite(lastDaily?.rewardPointsTotal) ? lastDaily.rewardPointsTotal : 0;
-        const currentPeriod = await this.getCurrentPeriodKey();
+        const computed = await this.computeRewardsSinceBaseline();
+        const rewardsToday = computed.rewardPointsTotal;
 
-        if (!running || runningDay !== currentPeriod) {
-          this.log('Periodic summary: running counter missing or mismatched; computing fallback via getDailySummary');
-          try {
-            const computed = await this.getDailySummary();
-            if (computed && Number.isFinite(computed.rewardPointsTotal)) {
-              running = computed.rewardPointsTotal;
-              try { chrome.storage.local.set({ [this._dailyRunningRewardKey]: running, [this._dailyRunningRewardDayKey]: currentPeriod }, () => { this.log('Periodic summary: persisted computed running counter', { running, period: currentPeriod }); }); } catch (err) { this.warn('Periodic summary: failed to persist computed running counter', err); }
-            } else this.warn('Periodic summary: computed fallback missing rewardPointsTotal; leaving persisted running as-is', { running, runningDay });
-          } catch (err) { this.warn('Periodic summary: fallback computation failed', err); }
-        }
-
-        let rewardsToday = running - lastDailyPoints; if (rewardsToday < 0) rewardsToday = running;
         const fromTs = new Date(this.previousValues.timestamp).toLocaleString('en-US', { month: '2-digit', day: '2-digit', year: 'numeric', hour: 'numeric', minute: '2-digit' }), toTs = new Date().toLocaleString('en-US', { month: '2-digit', day: '2-digit', year: 'numeric', hour: 'numeric', minute: '2-digit' });
         const headerLines = [`📊 Summary (${fromTs} - ${toTs}):`, '', `Downloads this period: ${totalEquivalent} (downloads + 2X prints)`, '', 'Model updates:', ''];
         const maxModelsInMessage = 200;
@@ -888,47 +906,6 @@ class ValueMonitor {
     finally { this.isChecking = false; try { await this.releaseProcessingLock(); } catch (e) { this.warn('Failed to release processing lock', e); } }
   }
 
-  // accumulate running points with lock and retries
-  async _accumulateDailyRewardPoints(pointsToAdd, attempt = 1) {
-    if (!Number.isFinite(pointsToAdd) || pointsToAdd <= 0) return;
-    const MAX_ATTEMPTS = 3, BASE_DELAY_MS = 300, MAX_BACKOFF_MS = 3000, lockTimeoutMs = 1500;
-    while (attempt <= MAX_ATTEMPTS) {
-      const lockAcquired = await this.acquireDailyLock(lockTimeoutMs);
-      if (!lockAcquired) {
-        if (attempt >= MAX_ATTEMPTS) { this.warn(`_accumulateDailyRewardPoints: lock not acquired after ${MAX_ATTEMPTS} attempts; skipping this accumulation.`); return; }
-        const backoff = Math.min(MAX_BACKOFF_MS, BASE_DELAY_MS * Math.pow(2, attempt-1));
-        const jitter = Math.floor(Math.random() * Math.min(500, Math.floor(backoff/2)));
-        const delay = backoff + jitter; this.log(`_accumulateDailyRewardPoints: lock not acquired (attempt ${attempt}). Waiting ${delay}ms then retrying.`); await new Promise(r=>setTimeout(r, delay)); attempt++; continue;
-      }
-
-      try {
-        const periodKey = await this.getCurrentPeriodKey();
-        const local = await new Promise(res => chrome.storage.local.get([this._dailyRunningRewardKey, this._dailyRunningRewardDayKey], r => res(r)));
-        let running = (local && local[this._dailyRunningRewardKey]) ? local[this._dailyRunningRewardKey] : 0;
-        const runningDay = (local && local[this._dailyRunningRewardDayKey]) ? local[this._dailyRunningRewardDayKey] : null;
-        this.log('_accumulateDailyRewardPoints read', { running, runningDay, periodKey, pointsToAdd, attempt });
-
-        if (runningDay && runningDay !== periodKey) {
-          const runningDayTs = new Date(runningDay).getTime(), periodKeyTs = new Date(periodKey).getTime();
-          if (Number.isFinite(runningDayTs) && Number.isFinite(periodKeyTs)) {
-            if (runningDayTs > periodKeyTs) { this.log('_accumulateDailyRewardPoints: stored runningDay is in the future; resetting running to 0 and continuing', { runningDay, periodKey }); running = 0; }
-            else { this.warn('_accumulateDailyRewardPoints: stored runningDay older than current period; aborting to avoid joining wrong window', { runningDay, periodKey }); return; }
-          } else { this.log('_accumulateDailyRewardPoints: could not parse runningDay/periodKey; resetting running to 0 and continuing', { runningDay, periodKey }); running = 0; }
-        }
-        if (!runningDay) { this.log('_accumulateDailyRewardPoints resetting running counter for new period', { oldDay: runningDay, newPeriod: periodKey }); running = 0; }
-        running += pointsToAdd;
-        await new Promise(resolve => {
-          chrome.storage.local.set({ [this._dailyRunningRewardKey]: running, [this._dailyRunningRewardDayKey]: periodKey }, (err) => {
-            if (chrome.runtime.lastError || err) this.warn('Storage set failed (quota or other error):', chrome.runtime.lastError || err);
-            else this.log(`_accumulateDailyRewardPoints: added ${pointsToAdd}, running=${running}, period=${periodKey}`);
-            resolve();
-          });
-        });
-        return;
-      } finally { await this.releaseDailyLock(); }
-    }
-  }
-
   // previousValues persistence
   async loadPreviousValues(){ return new Promise(resolve => chrome.storage.local.get(['previousValues'], result => { if (result?.previousValues) { this.log('Previous values loaded:', result.previousValues); this.previousValues = result.previousValues; } resolve(); })); }
   async savePreviousValues(values){ return new Promise(resolve => chrome.storage.local.set({ previousValues: values }, () => { this.log('Values saved to storage'); resolve(); })); }
@@ -940,6 +917,7 @@ class ValueMonitor {
     chrome.storage.sync.get(['telegramToken','chatId','refreshInterval','dailyReport','dailyNotificationTime','notifySummaryMode'], async (config) => {
       if (!config || !config.telegramToken || !config.chatId) { this.error('Missing Telegram configuration'); return; }
       this.telegramToken = config.telegramToken; this.chatId = config.chatId; this.notifySummaryMode = !!config.notifySummaryMode;
+      this._dailyNotificationTime = config.dailyNotificationTime || '12:00';
       const refreshInterval = config.refreshInterval || 900000;
       this.log(`Configured refresh interval: ${refreshInterval}ms`); this.log(`Notify summary mode: ${this.notifySummaryMode}`);
       let intervalToUse = refreshInterval; const ONE_HOUR = 60*60*1000; const COMPENSATION_MS = 60*1000;
@@ -989,7 +967,32 @@ class ValueMonitor {
              // We don't schedule the next one here anymore. The page reload will restart the script.
           });
           
-          try { window.location.reload(); } catch (e) { this.error('Reload failed:', e); }
+          try {
+            // Avoid reloading within 5 minutes of the daily notification time to prevent spawning new instances near the daily run
+            try {
+              if (this._dailyNotificationTime) {
+                const [dh, dm] = String(this._dailyNotificationTime).split(':').map(Number);
+                const nowDt = new Date();
+                const candidate = new Date(nowDt.getFullYear(), nowDt.getMonth(), nowDt.getDate(), dh, dm, 0, 0);
+                const diffMs = Math.abs(candidate.getTime() - Date.now());
+                const FIVE_MIN_MS = 5 * 60 * 1000;
+                if (diffMs < FIVE_MIN_MS) {
+                  this.log('Skipping reload because it is within 5 minutes of daily notification time.');
+                  // postpone the reload - schedule next run later
+                  const postponed = Date.now() + intervalToUse;
+                  chrome.storage.local.set({ [STORAGE_KEY]: postponed });
+                  this._lastScheduledSkip = true;
+                } else {
+                  window.location.reload();
+                }
+              } else {
+                window.location.reload();
+              }
+            } catch(e) {
+              this.error('Reload check failed, attempting reload anyway', e);
+              window.location.reload();
+            }
+          } catch (e) { this.error('Reload failed:', e); }
 
         }, delay);
       };
@@ -1039,59 +1042,144 @@ class ValueMonitor {
   // interim summary (manual request)
   async handleInterimSummaryRequest() {
     this.log('Interim summary requested');
+    await autoScrollToFullBottom();
+    const summary = await this.computeRewardsSinceBaseline();
     const currentValues = this.getCurrentValues();
-    if (!currentValues) { this.error('Interim summary aborted: could not extract current values'); throw new Error('No current values'); }
-    const baseline = await new Promise(res => chrome.storage.local.get([this._dailyStatsKey], r => res(r?.[this._dailyStatsKey] || null)));
-    if (!baseline) { this.error('Interim summary aborted: no baseline dailyStats found'); throw new Error('No baseline dailyStats found'); }
+    if (!summary) { this.error('Interim summary aborted: could not compute summary'); throw new Error('No summary computed'); }
 
-    const previousDay = baseline;
-    const modelChanges = {};
-    for (const [id, current] of Object.entries(currentValues.models)) {
-      let previous = previousDay?.models?.[id] || null;
-      if (!previous && current.permalink) previous = Object.values(previousDay.models || {}).find(m => m && m.permalink === current.permalink) || null;
-      if (!previous && current.name) previous = Object.values(previousDay.models || {}).find(m => m?.name?.trim().toLowerCase() === current.name.trim().toLowerCase()) || null;
-      if (!previous) { this.log('New model found (interim):', current.name); continue; }
-      const downloadsGained = Math.max(0, (Number(current.downloads) || 0) - (Number(previous.downloads) || 0));
-      const printsGained = Math.max(0, (Number(current.prints) || 0) - (Number(previous.prints) || 0));
-      if (downloadsGained > 0 || printsGained > 0) modelChanges[id] = { id, name: current.name, downloadsGained, printsGained, previousDownloads: previous.downloads || 0, previousPrints: previous.prints || 0, currentDownloads: current.downloads || 0, currentPrints: current.prints || 0, imageUrl: current.imageUrl || '' };
+    const lines = [];
+    lines.push(`📅 Interim Summary (${summary.from} → ${summary.to})`);
+
+    // --- Rewards Earned So Far ---
+    try {
+      lines.push('');
+      lines.push(`🎁 Rewards Earned So Far: +${summary.rewardPointsTotal} pts`);
+    } catch (err) {
+      this.warn('Rewards Earned So Far section failed:', err);
     }
 
-    const dailyDownloads = Object.values(modelChanges).reduce((s,m)=>s+m.downloadsGained,0);
-    const dailyPrints = Object.values(modelChanges).reduce((s,m)=>s+m.printsGained,0);
-    const top5Downloads = Object.values(modelChanges).filter(m=>m.downloadsGained>0).sort((a,b)=>b.downloadsGained-a.downloadsGained).slice(0,5);
-    const top5Prints = Object.values(modelChanges).filter(m=>m.printsGained>0).sort((a,b)=>b.printsGained-a.printsGained).slice(0,5);
+    // --- Average Daily Rewards (Past 7 summaries) ---
+    try {
+      const historyKey = 'dailyRewardHistory';
+      let history = await new Promise(res => chrome.storage.local.get([historyKey], r => res(r?.[historyKey] || [])));
 
-    let rewardsEarned = [], rewardPointsTotal = 0;
-    for (const m of Object.values(modelChanges)) {
-      const prevTotal = this.calculateDownloadsEquivalent(m.previousDownloads, m.previousPrints);
-      const currTotal = this.calculateDownloadsEquivalent(m.currentDownloads, m.currentPrints);
-      let cursor = prevTotal; const thresholdsHit=[]; const maxThresholdsPerModel=50; let count=0;
-      while (cursor < currTotal && count < maxThresholdsPerModel) {
-        const interval = this.getRewardInterval(cursor), mod = cursor % interval;
-        const nextThreshold = (cursor===0 || mod===0) ? cursor+interval : cursor+(interval-mod);
-        if (nextThreshold <= currTotal) { const pts = this.getRewardPointsForDownloads(nextThreshold); thresholdsHit.push({ threshold: nextThreshold, points: pts }); rewardPointsTotal += pts; cursor = nextThreshold; count++; } else break;
+      // Compute average without adding current period
+      const sum = history.reduce((a, b) => a + b, 0);
+      const avg = history.length > 0 ? (sum / history.length) : 0;
+      const avgPts = Math.round(avg);
+      const avgCount = history.length;
+
+      lines.push(`🎁 Average Daily Rewards (Past ${avgCount} summaries): +${avgPts} pts/day — based on last ${avgCount} summaries`);
+    } catch (err) {
+      this.warn('Average Daily Rewards section failed:', err);
+    }
+
+    // --- Models Close to 🎁 ---
+    try {
+      lines.push('');
+      let closeToGiftCount = 0;
+      
+      const allModels = Object.values(currentValues.models || {});
+      for (const m of allModels) {
+        const downloads = Number(m.downloads || 0);
+        const prints = Number(m.prints || 0);
+        const total = this.calculateDownloadsEquivalent(downloads, prints);
+        const next = this.nextRewardDownloads(total);
+        const remaining = Math.max(0, next - total);
+        if (remaining <= 2) closeToGiftCount++;
       }
-      if (thresholdsHit.length) rewardsEarned.push({ id:m.id, name:m.name, thresholds:thresholdsHit.map(t=>t.threshold), rewardPointsTotalForModel:thresholdsHit.reduce((s,t)=>s+t.points,0) });
+      
+      lines.push(`⚙️ Models Close to 🎁: ${closeToGiftCount > 0 ? closeToGiftCount : 'none'}`);
+    } catch (err) {
+      this.warn('Models Close to 🎁 section failed:', err);
     }
 
-    const totalEquivalent = dailyDownloads + (dailyPrints * 2);
-    const topDownloadsList = top5Downloads.length ? top5Downloads.map((m,i)=>`${i+1}. ${m.name}: +${m.downloadsGained}`).join('\n') : 'No new downloads so far';
-    const topPrintsList = top5Prints.length ? top5Prints.map((m,i)=>`${i+1}. ${m.name}: +${m.printsGained}`).join('\n') : 'No new prints so far';
-    const fromTs = new Date(previousDay.timestamp).toLocaleString('en-US', { month: '2-digit', day: '2-digit', year: 'numeric', hour: 'numeric', minute: '2-digit' }), toTs = new Date().toLocaleString('en-US', { month: '2-digit', day: '2-digit', year: 'numeric', hour: 'numeric', minute: '2-digit' });
-    const message = `
-🔔 Interim Summary (${fromTs} - ${toTs}):
+    // --- Boosts Received So Far ---
+    try {
+      lines.push('');
+      lines.push(`⚡ Boosts Received So Far: +${summary.dailyBoosts}`);
+    } catch (err) {
+      this.warn('Boosts Received So Far section failed:', err);
+    }
 
-Total Downloads: ${totalEquivalent} [downloads + 2x prints]
+    // --- Total Downloads So Far ---
+    try {
+      lines.push('');
+      const weightedTotal = summary.dailyDownloads + 2 * summary.dailyPrints;
+      lines.push(`⬇️ Total Downloads So Far (downloads + 2X prints): +${weightedTotal}`);
+    } catch (err) {
+      this.warn('Total Downloads So Far section failed:', err);
+    }
 
-🏆 Top Downloads:
-${topDownloadsList}
+    // --- Models per Reward Tier ---
+    try {
+      lines.push('');
+      const tierCounts = { 1: 0, 2: 0, 3: 0, 4: 0 };
 
-🖨️ Top Prints:
-${topPrintsList}
+      const allModels = Object.values(currentValues.models || {});
+      for (const m of allModels) {
+        const downloads = Number(m.downloads || 0);
+        const prints = Number(m.prints || 0);
+        const tier = this.getRewardCategory(downloads, prints);
+        tierCounts[tier]++;
+      }
 
-🎁 Rewards earned so far:
-${rewardsEarned.length > 0 ? rewardsEarned.map(r => `${r.name}: +${r.rewardPointsTotalForModel} points (thresholds: ${r.thresholds.join(', ')})`).join('\n') : 'No rewards earned so far'}
-`.trim();
+      const totalModels = allModels.length || 0;
+      lines.push('📊 Models per Reward Tier:');
+      if (totalModels > 0) {
+        for (let t = 1; t <= 4; t++) {
+          const pct = totalModels > 0 ? ((tierCounts[t] / totalModels) * 100).toFixed(0) : '0';
+          let label;
+          if (t === 1) label = '(0–49)';
+          else if (t === 2) label = '(50–499)';
+          else if (t === 3) label = '(500–999)';
+          else label = '(1000+)';
+          lines.push(`  Tier ${t} ${label}: ${tierCounts[t]} (${pct}%)`);
+        }
+      } else {
+        lines.push(' (no models found)');
+      }
+    } catch (err) {
+      this.warn('Models per Reward Tier section failed:', err);
+    }
+    
+    // --- Top 10 Models ---
+    try {
+      lines.push('');
+      const allChanges = Object.values(summary.modelChanges);
+      
+      const weightedChanges = allChanges.map(m => {
+        const weightedDownloadsToday = (m.downloadsGained || 0) + 2 * (m.printsGained || 0);
+        const totalWeighted = (m.currentDownloads || 0) + 2 * (m.currentPrints || 0);
+        
+        return {
+          name: m.name,
+          weightedDownloadsToday,
+          totalWeighted
+        };
+      })
+      .filter(m => m.weightedDownloadsToday > 0);
+      
+      weightedChanges.sort((a, b) => {
+        if (a.weightedDownloadsToday !== b.weightedDownloadsToday) {
+          return b.weightedDownloadsToday - a.weightedDownloadsToday;
+        }
+        return a.name.localeCompare(b.name);
+      });
+      
+      lines.push('🔝 Top 10 Models (Downloads + 2X Prints):');
+      if (weightedChanges.length === 0) {
+        lines.push('  No models with download or print activity today.');
+      } else {
+        weightedChanges.slice(0, 10).forEach((m, i) => {
+          lines.push(`  ${i + 1}. ${m.name} — +${m.weightedDownloadsToday} (total ${m.totalWeighted})`);
+        });
+      }
+    } catch (err) {
+      this.warn('Top 10 Models section failed:', err);
+    }
+
+    const message = lines.join('\n');
     this.log('Interim message:', message);
     const sent = await this.sendTelegramMessage(message);
     if (!sent) { this.error('Interim summary: failed to send via Telegram'); throw new Error('Telegram send failed'); }
@@ -1101,6 +1189,7 @@ ${rewardsEarned.length > 0 ? rewardsEarned.map(r => `${r.name}: +${r.rewardPoint
 
   // ---------------------------------------------------------------------------
   // NEW: Restore _compileAndSendDailySummary for 24-hour daily report
+  // (REFORMATTED per user request)
   // ---------------------------------------------------------------------------
   async _compileAndSendDailySummary() {
     try {
@@ -1111,47 +1200,165 @@ ${rewardsEarned.length > 0 ? rewardsEarned.map(r => `${r.name}: +${r.rewardPoint
         return;
       }
 
-      // Build message
       const lines = [];
-      lines.push(`📅 Daily Summary (${summary.from} → ${summary.to})`, '');
+      lines.push(`📅 Daily Summary (${summary.from} → ${summary.to})`);
 
-      lines.push(`Total Downloads Today: ${summary.dailyDownloads}`);
-      lines.push(`Total Prints Today: ${summary.dailyPrints}`);
-      
-      // Show both current total and daily delta for full context
-      const netChange =
-        summary.pointsGained > 0 ? `+${summary.pointsGained}` :
-        summary.pointsGained < 0 ? `${summary.pointsGained}` : '±0';
-      lines.push(`Account Points: ${summary.points}  (net change ${netChange})`);
-      lines.push('');
-
-      if (summary.top5Downloads?.length) {
-        lines.push('🏆 Top 5 Downloads:');
-        summary.top5Downloads.forEach((m, i) => {
-          lines.push(`${i + 1}. ${m.name} (+${m.downloadsGained})`);
-        });
-        lines.push('');
-      }
-
-      if (summary.top5Prints?.length) {
-        lines.push('🖨️ Top 5 Prints:');
-        summary.top5Prints.forEach((m, i) => {
-          lines.push(`${i + 1}. ${m.name} (+${m.printsGained})`);
-        });
-        lines.push('');
-      }
-
-      if (summary.rewardsEarned?.length) {
+      // --- Rewards Earned Today ---
+      try {
         const totalRewards = summary.rewardPointsTotal || 0;
+        lines.push('');
         lines.push(`🎁 Rewards Earned Today: +${totalRewards} pts`);
-      } else {
-        lines.push('🎁 No new rewards earned today');
+      } catch (err) {
+        this.warn('Rewards Earned Today section failed:', err);
       }
 
+      // --- Average Daily Rewards (Past 7 Days) ---
+      try {
+        const historyKey = 'dailyRewardHistory';
+        let history = await new Promise(res => chrome.storage.local.get([historyKey], r => res(r?.[historyKey] || [])));
+        
+        // Add today's summary to history
+        const totalRewards = summary.rewardPointsTotal || 0;
+        history.push(totalRewards);
+        if (history.length > 7) {
+          history = history.slice(-7);
+        }
+        // Save updated history
+        await new Promise(res => chrome.storage.local.set({ [historyKey]: history }, res));
+
+        // Compute average for message
+        const sum = history.reduce((a, b) => a + b, 0);
+        const avg = history.length > 0 ? (sum / history.length) : 0;
+        const avgPts = Math.round(avg);
+        const avgCount = history.length;
+
+        lines.push(`🎁 Average Daily Rewards (Past ${avgCount} summaries): +${avgPts} pts/day — based on last ${avgCount} summaries`);
+      } catch (err) {
+        this.warn('Average Daily Rewards section failed:', err);
+      }
+
+      // --- Models Close to 🎁 ---
+      try {
+        lines.push('');
+        const currentValues = this.getCurrentValues() || {};
+        const allModels = Object.values(currentValues.models || {});
+        let closeToGiftCount = 0;
+        
+        for (const m of allModels) {
+          const downloads = Number(m.downloads || 0);
+          const prints = Number(m.prints || 0);
+          const total = this.calculateDownloadsEquivalent(downloads, prints);
+          const next = this.nextRewardDownloads(total);
+          const remaining = Math.max(0, next - total);
+          if (remaining <= 2) closeToGiftCount++;
+        }
+        
+        lines.push(`⚙️ Models Close to 🎁: ${closeToGiftCount > 0 ? closeToGiftCount : 'none'}`);
+      } catch (err) {
+        this.warn('Models Close to 🎁 section failed:', err);
+      }
+
+      // --- Boosts Received Today ---
+      try {
+        lines.push('');
+        const dailyBoosts = summary.dailyBoosts || 0;
+        lines.push(`⚡ Boosts Received Today: +${dailyBoosts}`);
+      } catch (err) {
+        this.warn('Boosts Received Today section failed:', err);
+      }
+
+      // --- Total Downloads Today ---
+      try {
+        lines.push('');
+        const weightedTotal = (summary.dailyDownloads || 0) + 2 * (summary.dailyPrints || 0);
+        lines.push(`⬇️ Total Downloads Today (downloads + 2X prints): +${weightedTotal}`);
+      } catch (err) {
+        this.warn('Total Downloads Today section failed:', err);
+      }
+
+      // --- Models per Reward Tier ---
+      try {
+        lines.push('');
+        const currentValues = this.getCurrentValues() || {};
+        const allModels = Object.values(currentValues.models || {});
+        const tierCounts = { 1: 0, 2: 0, 3: 0, 4: 0 };
+
+        for (const m of allModels) {
+          const downloads = Number(m.downloads || 0);
+          const prints = Number(m.prints || 0);
+          const tier = this.getRewardCategory(downloads, prints);
+          tierCounts[tier]++;
+        }
+
+        const totalModels = allModels.length || 0;
+        lines.push('📊 Models per Reward Tier:');
+        if (totalModels > 0) {
+          for (let t = 1; t <= 4; t++) {
+            const pct = totalModels > 0 ? ((tierCounts[t] / totalModels) * 100).toFixed(0) : '0';
+            let label;
+            if (t === 1) label = '(0–49)';
+            else if (t === 2) label = '(50–499)';
+            else if (t === 3) label = '(500–999)';
+            else label = '(1000+)';
+            lines.push(`  Tier ${t} ${label}: ${tierCounts[t]} (${pct}%)`);
+          }
+        } else {
+          lines.push(' (no models found)');
+        }
+      } catch (err) {
+        this.warn('Models per Reward Tier section failed:', err);
+      }
+      
+      // --- Top 10 Models ---
+      try {
+        lines.push('');
+        // Get the full list of changes from the summary object
+        const allChanges = Object.values(summary.modelChanges || {});
+        
+        const weightedChanges = allChanges.map(m => {
+          // m.downloadsGained/printsGained/boostsGained are from modelChanges
+          const weightedDownloadsToday = (m.downloadsGained || 0) + 2 * (m.printsGained || 0);
+          // m.currentDownloads/currentPrints are also from modelChanges
+          const totalWeighted = (m.currentDownloads || 0) + 2 * (m.currentPrints || 0);
+          
+          return {
+            name: m.name,
+            weightedDownloadsToday,
+            totalWeighted
+          };
+        })
+        .filter(m => m.weightedDownloadsToday > 0); // Only show models with activity
+        
+        // Sort: desc by weightedDownloads, then asc by name
+        weightedChanges.sort((a, b) => {
+          if (a.weightedDownloadsToday !== b.weightedDownloadsToday) {
+            return b.weightedDownloadsToday - a.weightedDownloadsToday;
+          }
+          return a.name.localeCompare(b.name);
+        });
+        
+        lines.push('🔝 Top 10 Models (Downloads + 2X Prints):');
+        if (weightedChanges.length === 0) {
+          lines.push('  No models with download or print activity today.');
+        } else {
+          weightedChanges.slice(0, 10).forEach((m, i) => {
+            // 1. Christmas Box — +5 (total 17)
+            lines.push(`  ${i + 1}. ${m.name} — +${m.weightedDownloadsToday} (total ${m.totalWeighted})`);
+          });
+        }
+      } catch (err) {
+        this.warn('Top 10 Models section failed:', err);
+      }
+
+      // --- Send Message ---
       const message = lines.join('\n');
       this.log('_compileAndSendDailySummary: message length =', message.length);
       await this.sendTelegramMessage(message);
-      this.log('_compileAndSendDailySummary: daily summary sent successfully');
+      this.log('_compileAndSendDailySummary: daily summary sent successfully (with new format)');
+
+      const periodKey = await this.getCurrentPeriodKey();
+      const snapshot = { models: this.getCurrentValues().models || {}, points: summary.points || 0, timestamp: Date.now() };
+      chrome.storage.local.set({ [this._lastSuccessfulKey]: { state:'SENT', owner:this._instanceId, sentAt:Date.now(), periodKey, snapshot, rewardPointsTotal: summary.rewardPointsTotal } });
     } catch (err) {
       this.error('_compileAndSendDailySummary error:', err);
     }
@@ -1178,7 +1385,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
   if (msg?.type === 'CONFIG_SAVED') {
-    chrome.storage.sync.get(['notifySummaryMode'], cfg => { monitor.notifySummaryMode = !!(cfg?.notifySummaryMode); monitor.log('CONFIG_SAVED received. notifySummaryMode =', monitor.notifySummaryMode); monitor.restart().then(()=>sendResponse({ok:true})).catch(err=>sendResponse({ok:false, error: err?.message})); });
+    chrome.storage.sync.get(['notifySummaryMode'], cfg => { monitor.notifySummaryMode = !!(cfg?.notifySummaryMode); monitor.log('CONFIG_SAVAGED received. notifySummaryMode =', monitor.notifySummaryMode); monitor.restart().then(()=>sendResponse({ok:true})).catch(err=>sendResponse({ok:false, error: err?.message})); });
     return true;
   }
 });
