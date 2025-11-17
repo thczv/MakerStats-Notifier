@@ -1,4 +1,42 @@
-const ITERATION = 'Iteration 20.7.8';
+/*
+===========================================================
+TABLE OF CONTENTS — LOGICAL CHUNKS
+===========================================================
+
+Chunk 1 – Top-Level Setup
+Chunk 2 – Constructor
+Chunk 3 – Logging Helpers
+Chunk 4 – Scrolling Logic
+Chunk 5 – Period Key + Telegram
+Chunk 6 – Scraping
+Chunk 7 – Reward Helper Functions
+Chunk 8 – Locking
+Chunk 9 – ReloadGuard
+Chunk 10 – Daily Pre-Send Checks
+Chunk 11 – computeRewardsSinceBaseline
+Chunk 12 – getDailySummary
+Chunk 13 – Daily Scheduler
+Chunk 14 – checkAndNotify
+Chunk 15 – previousValues persistence
+Chunk 16 – Lifecycle
+Chunk 17 – Interim Summary
+Chunk 18 – Full Daily Summary
+
+===========================================================
+NOTES FOR LLM ASSISTANTS
+-----------------------------------------------------------
+Use the table of contents to understand the overall layout.
+Each chunk is marked with "START OF CHUNK X" and
+"END OF CHUNK X" comments in the file.
+You may request a chunk by number for clarity.
+===========================================================
+*/
+
+// ===========================================================
+// START OF CHUNK 1 — Top-Level Setup
+// ===========================================================
+
+const ITERATION = 'Iteration 20.8.5';
 console.log(`Initializing monitor — ${ITERATION}`);
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
@@ -8,6 +46,70 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 // incremental lazy-loading where elements append after short delays.
 
 class ValueMonitor {
+
+// ===========================================================
+// END OF CHUNK 1 — Top-Level Setup
+// ===========================================================
+
+// ===========================================================
+// START OF CHUNK 2 — Constructor
+// ===========================================================
+
+  constructor() {
+    // config/state
+    this.telegramToken = '';
+    this.chatId = '';
+    this.previousValues = null;
+    this.checkInterval = null;
+    this._dailyTimerId = null;
+    this.isChecking = false;
+    // identity/keys/timeouts
+    this._instanceId = Math.random().toString(36).slice(2);
+    this._dailyLockKey = 'dailyLock';
+    this._dailyStatsKey = 'dailyStats';
+    this._lastSuccessfulKey = 'lastSuccessfulDailyReport';
+    this._dailyLockTimeoutMs = 2 * 60 * 1000;
+	this._lastDailySentCooldownKey = 'lastDailySentCooldown';
+    // new keys/guards
+    this._dailyPlannedKey = 'dailyPlanned';
+    this._lastDailySentKey = 'lastDailySentAt';
+    this._dailyLockBaseKey = 'dailyLock';
+    this._dailyLockHoldMs = 3 * 60 * 1000; // hold daily lock for 3 minutes
+
+  // processing lock to avoid race between periodic checks and daily summary
+  this._processingLockKey = 'processingLock';
+  this._processingLockTimeoutMs = 2 * 60 * 1000; // 2 minutes
+    this._dailyMaxPreSendRetries = 5;
+    this._dailyPreSendBaseBackoffMs = 300;
+    this._dailyScheduleJitterMs = 10 * 1000; // reduced jitter ±10s
+    this._defaultFallbackHours = 48;
+    this.notifySummaryMode = false;
+    this._telegramMaxMessageChars = 4000;
+    this._suspiciousDeltaLimit = 200;
+    this._tempBaselineKey = 'tempDailyBaseline';
+    this._cumulativePeriodicKey = 'cumulativePeriodicRewards';
+  }
+
+// ===========================================================
+// END OF CHUNK 2 — Constructor
+// ===========================================================
+
+// ===========================================================
+// START OF CHUNK 3 — Logging Helpers
+// ===========================================================
+
+  // logging shorthands (preserve outputs)
+  log(...a){ console.log(...a); }
+  warn(...a){ console.warn(...a); }
+  error(...a){ console.error(...a); }
+
+// ===========================================================
+// END OF CHUNK 3 — Logging Helpers
+// ===========================================================
+
+// ===========================================================
+// START OF CHUNK 4 — Scrolling Logic
+// ===========================================================
 
   async autoScrollToFullBottom() {
     const BASE_DELAY_MS = 600;
@@ -61,44 +163,13 @@ class ValueMonitor {
     }
   }
 
-  constructor() {
-    // config/state
-    this.telegramToken = '';
-    this.chatId = '';
-    this.previousValues = null;
-    this.checkInterval = null;
-    this._dailyTimerId = null;
-    this.isChecking = false;
-    // identity/keys/timeouts
-    this._instanceId = Math.random().toString(36).slice(2);
-    this._dailyLockKey = 'dailyLock';
-    this._dailyStatsKey = 'dailyStats';
-    this._lastSuccessfulKey = 'lastSuccessfulDailyReport';
-    this._dailyLockTimeoutMs = 2 * 60 * 1000;
-    // new keys/guards
-    this._dailyPlannedKey = 'dailyPlanned';
-    this._lastDailySentKey = 'lastDailySentAt';
-    this._dailyLockBaseKey = 'dailyLock';
-    this._dailyLockHoldMs = 3 * 60 * 1000; // hold daily lock for 3 minutes
+// ===========================================================
+// END OF CHUNK 4 — Scrolling Logic
+// ===========================================================
 
-  // processing lock to avoid race between periodic checks and daily summary
-  this._processingLockKey = 'processingLock';
-  this._processingLockTimeoutMs = 2 * 60 * 1000; // 2 minutes
-    this._dailyMaxPreSendRetries = 5;
-    this._dailyPreSendBaseBackoffMs = 300;
-    this._dailyScheduleJitterMs = 10 * 1000; // reduced jitter ±10s
-    this._defaultFallbackHours = 48;
-    this.notifySummaryMode = false;
-    this._telegramMaxMessageChars = 4000;
-    this._suspiciousDeltaLimit = 200;
-    this._tempBaselineKey = 'tempDailyBaseline';
-    this._cumulativePeriodicKey = 'cumulativePeriodicRewards';
-  }
-
-  // logging shorthands (preserve outputs)
-  log(...a){ console.log(...a); }
-  warn(...a){ console.warn(...a); }
-  error(...a){ console.error(...a); }
+// ===========================================================
+// START OF CHUNK 5 — Period Key + Telegram
+// ===========================================================
 
   // period key uses user's dailyNotificationTime or 12:00 default
   async getCurrentPeriodKey() {
@@ -179,6 +250,14 @@ class ValueMonitor {
     }
   }
 
+// ===========================================================
+// END OF CHUNK 5 — Period Key + Telegram
+// ===========================================================
+
+// ===========================================================
+// START OF CHUNK 6 — Scraping
+// ===========================================================
+
   // scraping/parsing
   parseNumber(text){ if (!text) return 0; text = String(text).trim().toLowerCase(); if (text.includes('k')){ const base = parseFloat(text.replace('k','')); if (Number.isFinite(base)) return Math.round(base*1000); } const n = parseInt(text.replace(/[^\d]/g,''),10); return Number.isFinite(n)? n:0; }
 
@@ -199,6 +278,10 @@ class ValueMonitor {
         const modelTitle = element.querySelector('h3.translated-text');
         const name = modelTitle?.textContent.trim() || 'Model';
         const imageUrl = element.querySelector('img')?.getAttribute('src') || '';
+				// Detect exclusive badge via SVG color
+		const isExclusive = !!element.querySelector(
+		  '.design-icons-box svg path[fill="#B1FF42"]'
+		);
         let permalink = null;
         const anchor = element.querySelector('a[href*="/models/"], a[href*="/model/"], a[href*="/models/"]');
         if (anchor?.href) permalink = anchor.href;
@@ -208,13 +291,21 @@ class ValueMonitor {
           const boosts = this.parseNumber(lastThree[0]?.textContent || '0');
           const downloads = this.parseNumber(lastThree[1]?.textContent || '0');
           const prints = this.parseNumber(lastThree[2]?.textContent || '0');
-          currentValues.models[modelId] = { id: modelId, permalink, name, boosts, downloads, prints, imageUrl };
+		  currentValues.models[modelId] = { id: modelId, permalink, name, boosts, downloads, prints, imageUrl, isExclusive };
           this.log(`Model "${name}":`, { id: modelId, boosts, downloads, prints, permalink });
         } else this.log(`Not enough metrics for ${name} (found ${allMetrics.length})`);
       });
       return currentValues;
     } catch (err) { this.error('Error extracting values:', err); return null; }
   }
+
+// ===========================================================
+// END OF CHUNK 6 — Scraping
+// ===========================================================
+
+// ===========================================================
+// START OF CHUNK 7 — Reward Helper Functions
+// ===========================================================
 
   // reward math
   getRewardInterval(totalDownloads){ if (totalDownloads <= 50) return 10; if (totalDownloads <= 500) return 25; if (totalDownloads <= 1000) return 50; return 100; }
@@ -229,6 +320,13 @@ class ValueMonitor {
     return 4;
   }
 
+// ===========================================================
+// END OF CHUNK 7 — Reward Helper Functions
+// ===========================================================
+
+// ===========================================================
+// START OF CHUNK 8 — Locking
+// ===========================================================
 
   // storage lock helpers
   async acquireDailyLock(timeoutMs = this._dailyLockTimeoutMs) {
@@ -302,6 +400,14 @@ class ValueMonitor {
       } else resolve(false);
     }));
   }
+
+// ===========================================================
+// END OF CHUNK 8 — Locking
+// ===========================================================
+
+// ===========================================================
+// START OF CHUNK 9 — ReloadGuard
+// ===========================================================
 
   // ---- BEGIN ADDITION: ReloadGuard helpers (insert into ValueMonitor class) ----
 
@@ -413,6 +519,14 @@ class ValueMonitor {
 
   // ---- END ADDITION ----
 
+// ===========================================================
+// END OF CHUNK 9 — ReloadGuard
+// ===========================================================
+
+// ===========================================================
+// START OF CHUNK 10 — Daily Pre-Send Checks
+// ===========================================================
+
   // pre-send check to avoid duplicate daily sends
   async preSendCheckAndMaybeWait(startTime) {
     for (let attempt = 0; attempt < this._dailyMaxPreSendRetries; attempt++) {
@@ -423,6 +537,14 @@ class ValueMonitor {
     }
     return true;
   }
+
+// ===========================================================
+// END OF CHUNK 10 — Daily Pre-Send Checks
+// ===========================================================
+
+// ===========================================================
+// START OF CHUNK 11 — computeRewardsSinceBaseline
+// ===========================================================
 
   // side-effect-free computation of rewards since baseline
   async computeRewardsSinceBaseline() {
@@ -497,7 +619,7 @@ class ValueMonitor {
       if (downloadsGained <= 0 && printsGained <= 0 && boostsGained <= 0) continue;
       if (downloadsGained > this._suspiciousDeltaLimit || printsGained > this._suspiciousDeltaLimit) continue;
 
-      modelChanges[id] = { id, name: current.name, downloadsGained, printsGained, boostsGained, previousDownloads: prevDownloads, previousPrints: prevPrints, currentDownloads: currDownloads, currentPrints: currPrints, permalink: current.permalink || previous?.permalink || null };
+	  modelChanges[id] = { id, name: current.name, downloadsGained, printsGained, boostsGained, previousDownloads: prevDownloads, previousPrints: prevPrints, currentDownloads: currDownloads, currentPrints: currPrints, permalink: current.permalink || previous?.permalink || null, isExclusive: current.isExclusive };
     }
 
     const dailyDownloads = Object.values(modelChanges).reduce((s, m) => s + m.downloadsGained, 0);
@@ -517,15 +639,29 @@ class ValueMonitor {
         if (nextThreshold <= currentDownloadsTotal) {
           const rewardPoints = this.getRewardPointsForDownloads(nextThreshold);
           thresholdsHit.push({ threshold: nextThreshold, rewardPoints });
-          rewardPointsTotal += rewardPoints;
           cursor = nextThreshold; thresholdsCount++
         } else break;
       }
-      if (thresholdsHit.length) rewardsEarned.push({ id: m.id, name: m.name, thresholds: thresholdsHit.map(t => t.threshold), rewardPointsTotalForModel: thresholdsHit.reduce((s, t) => s + t.rewardPoints, 0) });
+		// Apply 25% bonus for Exclusive models
+		let baseReward = thresholdsHit.reduce((s, t) => s + t.rewardPoints, 0);
+		if (m.isExclusive) {
+		  baseReward *= 1.25;
+		}
+		const rewardPointsTotalForModel = baseReward;  // Keep as float
+		if (thresholdsHit.length) rewardsEarned.push({ id: m.id, name: m.name, isExclusive: !!m.isExclusive, thresholds: thresholdsHit.map(t => t.threshold), rewardPointsTotalForModel });
+		rewardPointsTotal += rewardPointsTotalForModel;
     }
 
     return { dailyDownloads, dailyPrints, dailyBoosts, points: currentValues.points, pointsGained: currentValues.points - (previousDay ? previousDay.points : 0), rewardsEarned, rewardPointsTotal, modelChanges, from: previousDay ? new Date(previousDay.timestamp).toLocaleString('en-US', { month: '2-digit', day: '2-digit', year: 'numeric', hour: 'numeric', minute: '2-digit' }) : 'Start', to: new Date().toLocaleString('en-US', { month: '2-digit', day: '2-digit', year: 'numeric', hour: 'numeric', minute: '2-digit' }) };
   }
+
+// ===========================================================
+// END OF CHUNK 11 — computeRewardsSinceBaseline
+// ===========================================================
+
+// ===========================================================
+// START OF CHUNK 12 — getDailySummary
+// ===========================================================
 
   // robust daily summary computation and storage
   async getDailySummary() {
@@ -539,6 +675,14 @@ class ValueMonitor {
     });
     return summary;
   }
+
+// ===========================================================
+// END OF CHUNK 12 — getDailySummary
+// ===========================================================
+
+// ===========================================================
+// START OF CHUNK 13 — Daily Scheduler
+// ===========================================================
 
   // schedule daily report with locking/claiming (robust: persist planned time and detect missed after reload)
   async scheduleDailyNotification() {
@@ -572,6 +716,14 @@ class ValueMonitor {
   }
 
   async _runDailyNotification() {
+	// Prevent daily summary if within 5 minutes of last successful send
+	const cooldown = await new Promise(res => chrome.storage.local.get([this._lastDailySentCooldownKey], r => res(r?.[this._lastDailySentCooldownKey] || 0)));
+	if (Date.now() < cooldown) {
+	  this.log('Daily summary skipped: within 5-minute cooldown after previous send');
+	  this.releaseDailyLock();
+	  this.scheduleDailyNotification(); // reschedule for tomorrow
+	  return;
+	}
     const acquired = await this.acquireDailyLock();
     if (!acquired) {
       this.log('Daily lock not acquired; retrying in 30s');
@@ -589,6 +741,14 @@ class ValueMonitor {
       await this.scheduleDailyNotification(); // Schedule next
     }
   }
+
+// ===========================================================
+// END OF CHUNK 13 — Daily Scheduler
+// ===========================================================
+
+// ===========================================================
+// START OF CHUNK 14 — checkAndNotify
+// ===========================================================
 
   // main periodic check (per-model messages or summary)
   async checkAndNotify() {
@@ -657,18 +817,19 @@ class ValueMonitor {
           
           const hasActivity = (downloadsDeltaRaw !== 0) || (printsDelta !== 0) || (boostsDelta > 0);
           
-          const modelSummary = {
-            id,
-            name: current.name,
-            imageUrl: current.imageUrl,
-            downloadsDeltaRaw,
-            printsDelta,
-            boostsDelta,
-            previousDownloadsTotal,
-            currentDownloadsTotal,
-            downloadsDeltaEquivalent,
-            rewards: []
-          };
+		  const modelSummary = {
+		    id,
+		    name: current.name,
+		    imageUrl: current.imageUrl,
+		    downloadsDeltaRaw,
+		    printsDelta,
+		    boostsDelta,
+		    previousDownloadsTotal,
+		    currentDownloadsTotal,
+		    downloadsDeltaEquivalent,
+		    rewards: [],
+		    isExclusive: current.isExclusive
+		  };
 
           if (currentDownloadsTotal > previousDownloadsTotal) {
             let cursor = previousDownloadsTotal, maxRewardsToReport = 50, rewardsFound = 0;
@@ -685,6 +846,11 @@ class ValueMonitor {
               }
             }
           }
+		  let baseReward = modelSummary.rewards.reduce((s, r) => s + r.points, 0);
+		  if (modelSummary.isExclusive) {
+		    baseReward *= 1.25;
+		  }
+		  modelSummary.totalRewardPoints = baseReward;  // Keep as float
           if (hasActivity || modelSummary.rewards.length > 0) {
             summaries[id] = modelSummary;
           }
@@ -765,7 +931,11 @@ class ValueMonitor {
         if (!this.notifySummaryMode) {
           if (boostOnly) {
             const lines = [];
-            lines.push(`⚡ Boost Update for: ${current.name}`, '', `⚡ Boosts: +${boostsDelta} (now ${current.boosts})`);
+			lines.push(
+			  `⚡ Boost Update for: ${current.name}`,
+			  '',
+			  `⚡ Boosts: +${boostsDelta} (now ${current.boosts})`
+			);
             let message = lines.join('\n');
             message = warningPrefix + diagnosticText + message; // Prepend warning if any
             warningPrefix = ''; diagnosticText = ''; // Clear after first use
@@ -779,10 +949,19 @@ class ValueMonitor {
           if (hasActivity2) {
             this.log('MESSAGE-BRANCH', { iteration: ITERATION, name: current.name, branch: 'milestone', downloadsDeltaEquivalent: modelSummary.downloadsDeltaEquivalent, boostsDelta, rewardsFound: rewards.length });
             const lines = []; const equivalentTotal = modelSummary.currentDownloadsTotal;
-            lines.push(`📦 Update for: ${current.name}`, '', `${modelSummary.downloadsDeltaEquivalent > 0 ? '+' : ''}${modelSummary.downloadsDeltaEquivalent} Downloads (total ${equivalentTotal})`, '');
-            if (rewards.length > 0) { rewards.forEach(r => lines.push(`🎁 Reward Earned! +${r.points} points at ${r.thresholdDownloads} downloads`)); lines.push(''); }
-            const nextThresholdAfterCurrent = this.nextRewardDownloads(equivalentTotal);
-            const downloadsUntilNext = Math.max(0, nextThresholdAfterCurrent - equivalentTotal);
+			const nextThresholdAfterCurrent = this.nextRewardDownloads(equivalentTotal);
+			const downloadsUntilNext = Math.max(0, nextThresholdAfterCurrent - equivalentTotal);
+			lines.push(
+			  `Update for: ${ (modelSummary.totalRewardPoints > 0 && current.isExclusive) ? '💎 ' : '' }${current.name}`,
+			  '',
+			  `${modelSummary.downloadsDeltaEquivalent > 0 ? '+' : ''}${modelSummary.downloadsDeltaEquivalent} Downloads (total ${equivalentTotal})`,
+			  ''
+			);
+			if (modelSummary.totalRewardPoints > 0) {
+			  lines.push(`🎁 Rewards Earned! +${Number(modelSummary.totalRewardPoints).toFixed(2)} pts`);
+			  lines.push('');
+			}
+
             lines.push(`🎯 Next Reward: ${downloadsUntilNext} more downloads (${nextThresholdAfterCurrent} total)`, '', `🔁 Reward Interval: every ${this.getRewardInterval(equivalentTotal)} downloads`);
             if (boostsDelta > 0) lines.push('', `⚡ Boosts: +${boostsDelta} (now ${current.boosts})`);
             let warning = '';
@@ -797,7 +976,7 @@ class ValueMonitor {
             anyNotification = true;
           }
         } else {
-          modelsActivity.push({ id, name: current.name, downloadsDeltaEquivalent: modelSummary.downloadsDeltaEquivalent, currentDownloadsTotal: modelSummary.currentDownloadsTotal, rewardPointsForThisModel: rewards.reduce((s,r)=>s+r.points,0), boostsDelta });
+          modelsActivity.push({ id, name: current.name, downloadsDeltaEquivalent: modelSummary.downloadsDeltaEquivalent, currentDownloadsTotal: modelSummary.currentDownloadsTotal, rewardPointsForThisModel: modelSummary.totalRewardPoints || 0, boostsDelta, isExclusive: modelSummary.isExclusive });
         }
       }
 
@@ -829,7 +1008,7 @@ class ValueMonitor {
         const modelLines=[]; let anyLargeDelta=false;
         list.forEach((m,i) => {
           const downloadsDelta = m.downloadsDeltaEquivalent || 0, total = m.currentDownloadsTotal || 0, interval = m.rewardInterval || this.getRewardInterval(total), nextThreshold = this.nextRewardDownloads(total), remaining = Math.max(0, nextThreshold - total), ptsEarned = m.rewardPointsForThisModel || 0;
-          let line = `${i+1}. ${m.name}: +${downloadsDelta} (total ${total})`; if (ptsEarned>0) line += `  🎉 +${ptsEarned} pts`; line += ` (needs ${remaining} for next 🎁, interval ${interval})`;
+          let line = `${i+1}. ${ (m.rewardPointsForThisModel > 0 && m.isExclusive) ? '💎 ' : '' }${m.name}: +${downloadsDelta} (total ${total})`; if (ptsEarned>0) line += `  🎉 +${Number(ptsEarned).toFixed(2)} pts`; line += ` (needs ${remaining} for next 🎁, interval ${interval})`;
           if (Math.abs(downloadsDelta) > this._suspiciousDeltaLimit) { line += `\n⚠️ The number of downloads during this period is very high. This could be because your model is very popular (good job!). Or it could be an error. You may want to shorten the refresh interval.`; anyLargeDelta=true; }
           if ((m.boostsDelta || 0) > 0) {
             line += `
@@ -852,8 +1031,8 @@ class ValueMonitor {
 		}
 		const footerLines = [
 		  '',
-		  `Rewards this period: ${rewardPointsThisRun} pts`,
-		  `Rewards today: ${rewardsToday} pts`,
+		  `Rewards this period: ${Number(rewardPointsThisRun).toFixed(2)} pts`,
+		  `Rewards today: ${Number(rewardsToday).toFixed(2)} pts`,
 		  `Models close to 🎁: ${closeToGiftCount}`
 		];
         // Cumulative check: Add this period's rewards to storage for error checking
@@ -881,9 +1060,25 @@ class ValueMonitor {
     finally { this.isChecking = false; try { await this.releaseProcessingLock(); } catch (e) { this.warn('Failed to release processing lock', e); } }
   }
 
+// ===========================================================
+// END OF CHUNK 14 — checkAndNotify
+// ===========================================================
+
+// ===========================================================
+// START OF CHUNK 15 — previousValues persistence
+// ===========================================================
+
   // previousValues persistence
   async loadPreviousValues(){ return new Promise(resolve => chrome.storage.local.get(['previousValues'], result => { if (result?.previousValues) { this.log('Previous values loaded:', result.previousValues); this.previousValues = result.previousValues; } resolve(); })); }
   async savePreviousValues(values){ return new Promise(resolve => chrome.storage.local.set({ previousValues: values }, () => { this.log('Values saved to storage'); resolve(); })); }
+
+// ===========================================================
+// END OF CHUNK 15 — previousValues persistence
+// ===========================================================
+
+// ===========================================================
+// START OF CHUNK 16 — Lifecycle
+// ===========================================================
 
   // lifecycle
   async start() {
@@ -1037,6 +1232,14 @@ return;
     }
   }
 
+// ===========================================================
+// END OF CHUNK 16 — Lifecycle
+// ===========================================================
+
+// ===========================================================
+// START OF CHUNK 17 — Interim Summary
+// ===========================================================
+
   // interim summary (manual request)
   async handleInterimSummaryRequest() {
     this.log('Interim summary requested');
@@ -1152,6 +1355,7 @@ try {
     return {
       name: r.name || 'Unnamed Model',
       rewardPoints: r.rewardPointsTotalForModel || 0,
+      isExclusive: r.isExclusive, // <-- FIX: Add the isExclusive property
       combinedToday,
       combinedTotal
     };
@@ -1167,7 +1371,7 @@ try {
     lines.push('🎁 Models That Earned Rewards Today (sorted by points):');
     rewardModels.forEach((m, i) => {
       lines.push(
-        ` ${i + 1}. ${m.name} — +${m.rewardPoints} pts` +
+		`${i + 1}. ${m.isExclusive ? '💎 ' : ''}${m.name} — +${Number(m.rewardPoints).toFixed(2)} pts` +	
         `\n (${m.combinedToday} downloads today, ${m.combinedTotal} total)`
       );
     });
@@ -1183,6 +1387,14 @@ try {
     this.log('Interim summary: sent successfully');
     return true;
   }
+
+// ===========================================================
+// END OF CHUNK 17 — Interim Summary
+// ===========================================================
+
+// ===========================================================
+// START OF CHUNK 18 — Full Daily Summary
+// ===========================================================
 
   // ---------------------------------------------------------------------------
   // NEW: Restore _compileAndSendDailySummary for 24-hour daily report
@@ -1314,9 +1526,10 @@ try {
     const m = summary.modelChanges?.[r.id] || {};
     const combinedToday = (m.downloadsGained || 0) + 2 * (m.printsGained || 0);
     const combinedTotal = (m.currentDownloads || 0) + 2 * (m.currentPrints || 0);
-    return {
+   return {
       name: r.name || 'Unnamed Model',
       rewardPoints: r.rewardPointsTotalForModel || 0,
+      isExclusive: r.isExclusive, // <-- FIX: Add the isExclusive property
       combinedToday,
       combinedTotal
     };
@@ -1332,7 +1545,7 @@ try {
     lines.push('🎁 Models That Earned Rewards Today (sorted by points):');
     rewardModels.forEach((m, i) => {
       lines.push(
-        ` ${i + 1}. ${m.name} — +${m.rewardPoints} pts` +
+		`${i + 1}. ${m.isExclusive ? '💎 ' : ''}${m.name} — +${m.rewardPoints} pts` +
         `\n (${m.combinedToday} downloads today, ${m.combinedTotal} total)`
       );
     });
@@ -1345,6 +1558,8 @@ try {
       const message = lines.join('\n');
       this.log('_compileAndSendDailySummary: message length =', message.length);
       await this.sendTelegramMessage(message);
+	  // Clear cooldown after successful send
+	  await new Promise(res => chrome.storage.local.remove([this._lastDailySentCooldownKey], res));
       this.log('_compileAndSendDailySummary: daily summary sent successfully (with new format)');
 
       const periodKey = await this.getCurrentPeriodKey();
@@ -1382,3 +1597,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 });
+
+// ===========================================================
+// END OF CHUNK 18 — Full Daily Summary
+// ===========================================================

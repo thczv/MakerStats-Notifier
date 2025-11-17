@@ -17,7 +17,7 @@ This extension periodically collects data from your MakerWorld "My Models" page,
 * **Real-Time Monitoring**: Checks for changes in your model stats at a configurable interval.
 * **Telegram Notifications**: Get updates via Telegram for:
     * New Downloads & Prints
-    * Reward Point Milestones
+    * Reward Point Milestones [Update: Added support for the 25% bonus for Exclusive models]
     * Boosts on your models
 * **Detailed Reward Tracking**: The extension calculates reward points earned based on MakerWorld's milestone system (e.g., +15 points at 50 downloads, +12 at 75, etc.). It clearly reports what you've earned and how far you are from the next milestone.
 * **Two Notification Modes**:
@@ -80,6 +80,8 @@ All settings can be configured from the extension's popup.
 | **Notification Mode** | Choose between **Per-Model** updates or a single **Summary** report for each check.                     |
 | **Daily Summary** | Enable or disable the daily 24-hour summary report.                                                     | 
 | **Daily Summary Time** | The time of day (in your local timezone) when the daily summary should be sent.                         | 
+| **Send Interim Summary** | Sends an update capturing progress so-far today, in the same format as the daily summary              |
+| **Restart Timer Now** | If you want your periodic summary to come at 55 minutes after the hour instead of 30 minutes after the hour (or whatever), you can use this button to restart the timer.|
 
 ---
 
@@ -141,7 +143,7 @@ When in Summary Mode, the extension counts and reports the number of models that
 
 ### The Extension Only Tracks Models
 
-The extension only tracks prints and downloads for models on MakerWorld. It does not track print profiles or the points received for "high quality" print profiles. Because of this, the number of points you actually receive will often be higher than the extension shows. 
+The extension only tracks prints and downloads for models on MakerWorld. It does track Exclusive models and the 25% points bonus that comes with that status. But it does not track print profiles or the points received for "high quality" print profiles.  It also doesn't track downloads or prints for MakerWorld's China site. Because of these things, the number of points you actually receive will often be higher than the extension shows. 
 
 ### Points Prediction
 
